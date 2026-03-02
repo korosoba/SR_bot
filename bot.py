@@ -1,32 +1,46 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import trafilatura
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from groq import Groq
 
-# Логирование — чтобы видеть ошибки в Render
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токены берём из переменных окружения (не из кода!)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+PORT = int(os.environ.get("PORT", 10000))
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
+# Минимальный веб-сервер — просто чтобы Render видел открытый порт
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # Отключаем лишние логи
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+
 def fetch_article(url: str):
-    """Скачивает и извлекает текст статьи по ссылке через trafilatura."""
     downloaded = trafilatura.fetch_url(url)
     if not downloaded:
         return None
-    text = trafilatura.extract(downloaded)
-    return text
+    return trafilatura.extract(downloaded)
 
 
 def process_with_groq(article_text: str) -> str:
-    """Отправляет текст в Groq и получает резюме + перевод на русском."""
     prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
 
 Твоя задача:
@@ -41,7 +55,6 @@ def process_with_groq(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
@@ -52,7 +65,6 @@ def process_with_groq(article_text: str) -> str:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик входящих сообщений."""
     url = update.message.text.strip()
 
     if not url.startswith("http"):
@@ -85,6 +97,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    # Запускаем веб-сервер в отдельном потоке
+    thread = threading.Thread(target=run_health_server, daemon=True)
+    thread.start()
+    logger.info(f"Health server запущен на порту {PORT}")
+
+    # Запускаем бота
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Бот запущен!")
