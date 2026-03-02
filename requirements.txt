@@ -1,0 +1,3 @@
+python-telegram-bot==21.6
+groq==0.11.0
+trafilatura==1.12.0
