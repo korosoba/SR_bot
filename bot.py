@@ -16,7 +16,7 @@ GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 
-def fetch_article(url: str) -> str | None:
+def fetch_article(url: str):
     """Скачивает и извлекает текст статьи по ссылке через trafilatura."""
     downloaded = trafilatura.fetch_url(url)
     if not downloaded:
@@ -35,7 +35,7 @@ def process_with_groq(article_text: str) -> str:
 
 Отвечай ТОЛЬКО на русском языке. Формат ответа:
 
-📌 *Краткое резюме:*
+📌 Краткое резюме:
 [текст резюме на русском]
 
 Статья:
@@ -55,17 +55,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик входящих сообщений."""
     url = update.message.text.strip()
 
-    # Простая проверка — похоже ли на ссылку
     if not url.startswith("http"):
         await update.message.reply_text(
             "👋 Привет! Отправь мне ссылку на статью (начинается с http), и я сделаю краткое резюме на русском."
         )
         return
 
-    # Сообщаем что начали работу
     status_msg = await update.message.reply_text("⏳ Читаю статью...")
 
-    # Парсим статью
     article_text = fetch_article(url)
     if not article_text:
         await status_msg.edit_text(
@@ -75,7 +72,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await status_msg.edit_text("🤖 Обрабатываю через Groq...")
 
-    # Отправляем в Groq
     try:
         result = process_with_groq(article_text)
     except Exception as e:
@@ -85,17 +81,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Отправляем результат
-    await status_msg.edit_text(result, parse_mode="Markdown")
+    await status_msg.edit_text(result)
 
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Бот запущен!")
-    await app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
