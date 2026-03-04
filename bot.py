@@ -21,6 +21,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+BATCH_SIZE = 50  # Статей за один запрос к Groq
+
 
 # --- Health server для Render ---
 
@@ -97,50 +99,102 @@ def parse_articles(md_text: str) -> list[dict]:
     return articles
 
 
-def digest_with_groq(articles: list[dict]) -> str:
-    articles_text = ""
-    for i, a in enumerate(articles, 1):
-        articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
-
-    prompt = f"""Ты — редактор, который сортирует статьи о кино и сериалах.
+DIGEST_PROMPT = """Ты — редактор, который сортирует статьи о кино и сериалах.
 
 Вот список статей. Распредели каждую по категориям по правилам ниже.
 
 ПРАВИЛА КАТЕГОРИЗАЦИИ:
 - ПРОПУСТИТЬ (не включать): новости, анонсы, игры, техника, аниме, комиксы, статьи об индустрии (сборы, рейтинги, бизнес)
-- 📋 ПОДБОРКИ: статьи формата "Лучшие X...", "10 лучших...", рейтинги, списки
-- 🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ: статьи о фильмах/сериалах вышедших примерно в последние 1-3 года (НЕ рецензии)
-- 🏛 КЛАССИКА: статьи о фильмах/сериалах вышедших 10 и более лет назад
-- 🌟 ПЕРСОНЫ: статьи о конкретных актёрах, режиссёрах, интересных людях
+- 📋 ПОДБОРКИ: статьи формата "Лучшие X...", "10 лучших...", рейтинги, списки фильмов/сериалов
+- 🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ: статьи о фильмах/сериалах вышедших примерно в последние 1-3 года (НЕ рецензии, НЕ подборки)
+- 🏛 КЛАССИКА: статьи о фильмах/сериалах вышедших 10 и более лет назад (ключевые слова: "X years later", "classic", "cult", старые названия)
+- 🌟 ПЕРСОНЫ: статьи о конкретных актёрах, режиссёрах, других интересных людях
 
-ФОРМАТ ОТВЕТА — строго такой, без лишнего текста:
+ВАЖНО:
+- Обработай ВСЕ статьи из списка, не пропускай ни одну подходящую
+- Одна статья может попасть только в одну категорию
+- Статьи о персонах (актёрах) включай в ПЕРСОНЫ, даже если они про старый фильм
+
+ФОРМАТ ОТВЕТА — строго такой, каждая категория на новой строке:
 
 📋 ПОДБОРКИ
-• [Название статьи]([ссылка])
+• [Название статьи](ссылка)
 
 🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ
-• [Название статьи]([ссылка])
+• [Название статьи](ссылка)
 
 🏛 КЛАССИКА
-• [Название статьи]([ссылка])
+• [Название статьи](ссылка)
 
 🌟 ПЕРСОНЫ
-• [Название статьи]([ссылка])
+• [Название статьи](ссылка)
 
-Если в категории нет статей — всё равно напиши заголовок категории и напиши "нет статей".
-Названия статей НЕ переводи — оставляй на английском.
+Если в категории нет статей — пропусти эту категорию совсем.
+Названия статей НЕ переводи.
 
 Вот статьи:
-{articles_text[:12000]}
 """
+
+
+def digest_batch_with_groq(articles: list[dict]) -> dict:
+    """Обрабатывает один батч статей, возвращает словарь {категория: [строки]}."""
+    articles_text = ""
+    for i, a in enumerate(articles, 1):
+        articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
 
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
         temperature=0.3,
-        max_tokens=3000,
+        max_tokens=4000,
     )
     return response.choices[0].message.content
+
+
+def merge_digests(batch_results: list[str]) -> str:
+    """Склеивает результаты нескольких батчей в один дайджест."""
+    categories = {
+        "📋 ПОДБОРКИ": [],
+        "🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ": [],
+        "🏛 КЛАССИКА": [],
+        "🌟 ПЕРСОНЫ": [],
+    }
+
+    current_cat = None
+    for result in batch_results:
+        for line in result.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line in categories:
+                current_cat = line
+            elif line.startswith("•") and current_cat:
+                # Убираем дубли
+                if line not in categories[current_cat]:
+                    categories[current_cat].append(line)
+
+    # Собираем итоговый текст
+    parts = []
+    for cat, items in categories.items():
+        if items:
+            parts.append(cat)
+            parts.extend(items)
+            parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def digest_with_groq(articles: list[dict]) -> tuple[str, int]:
+    """Обрабатывает все статьи батчами, возвращает итоговый дайджест и кол-во батчей."""
+    batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
+    batch_results = []
+
+    for i, batch in enumerate(batches):
+        logger.info(f"Обрабатываю батч {i+1}/{len(batches)} ({len(batch)} статей)")
+        result = digest_batch_with_groq(batch)
+        batch_results.append(result)
+
+    return merge_digests(batch_results), len(batches)
 
 
 # --- Error handler ---
@@ -184,9 +238,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📎 Отправь мне md-файл с дайджестом."
-    )
+    await update.message.reply_text("📎 Отправь мне md-файл с дайджестом.")
 
 
 async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,10 +263,13 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await status_msg.edit_text("❌ Не удалось найти статьи в файле.")
         return
 
-    await status_msg.edit_text(f"🤖 Нашёл {len(articles)} статей, обрабатываю через Groq...")
+    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
+    await status_msg.edit_text(
+        f"🤖 Нашёл {len(articles)} статей, обрабатываю через Groq ({n_batches} запроса)..."
+    )
 
     try:
-        result = digest_with_groq(articles)
+        result, n_batches_done = digest_with_groq(articles)
     except Exception as e:
         logger.error(f"Groq digest error: {e}")
         await status_msg.edit_text("❌ Ошибка Groq. Попробуй чуть позже.")
@@ -233,7 +288,7 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_document(
         document=open(out_path, "rb"),
         filename=result_filename,
-        caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей обработано",
+        caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей в {n_batches_done} запросах",
     )
 
     os.unlink(tmp_path)
@@ -246,10 +301,7 @@ def main():
     logger.info(f"Health server запущен на порту {PORT}")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # Обработчик ошибок — подавляет Conflict
     app.add_error_handler(handle_error)
-
     app.add_handler(CommandHandler("digest", handle_digest_command))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
     app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
