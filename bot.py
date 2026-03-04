@@ -9,6 +9,7 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     filters, ContextTypes
 )
+from telegram.error import Conflict
 from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
@@ -74,7 +75,6 @@ def process_with_groq(article_text: str) -> str:
 # --- Обработка дайджеста ---
 
 def parse_articles(md_text: str) -> list[dict]:
-    """Парсит md-файл и возвращает список статей."""
     articles = []
     blocks = md_text.split("---------")
     for block in blocks:
@@ -98,8 +98,6 @@ def parse_articles(md_text: str) -> list[dict]:
 
 
 def digest_with_groq(articles: list[dict]) -> str:
-    """Отправляет список статей в Groq для категоризации."""
-    # Формируем компактный список для Groq
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
@@ -145,16 +143,24 @@ def digest_with_groq(articles: list[dict]) -> str:
     return response.choices[0].message.content
 
 
+# --- Error handler ---
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        logger.warning("Конфликт инстансов — ожидаем завершения старого...")
+        return
+    logger.error(f"Ошибка: {context.error}")
+
+
 # --- Handlers ---
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ссылки на статью."""
     url = update.message.text.strip()
 
     if not url.startswith("http"):
         await update.message.reply_text(
             "👋 Привет! Отправь ссылку на статью — сделаю краткое резюме на русском.\n"
-            "Или отправь /digest с md-файлом для обработки дайджеста."
+            "Или отправь md-файл для обработки дайджеста."
         )
         return
 
@@ -178,24 +184,20 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /digest без файла — просим прислать файл."""
     await update.message.reply_text(
-        "📎 Отправь мне md-файл с дайджестом (можно прямо с подписью /digest или просто файлом)."
+        "📎 Отправь мне md-файл с дайджестом."
     )
 
 
 async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка md-файла присланного как документ."""
     doc: Document = update.message.document
 
-    # Принимаем только .md файлы
     if not doc.file_name.endswith(".md"):
         await update.message.reply_text("❌ Нужен файл формата .md")
         return
 
     status_msg = await update.message.reply_text("⏳ Читаю файл...")
 
-    # Скачиваем файл во временную директорию
     tg_file = await context.bot.get_file(doc.file_id)
     with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
         await tg_file.download_to_drive(tmp.name)
@@ -218,7 +220,6 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await status_msg.edit_text("❌ Ошибка Groq. Попробуй чуть позже.")
         return
 
-    # Отправляем результат как файл
     date_str = doc.file_name.replace("news-", "").replace(".md", "")
     result_filename = f"digest-{date_str}.txt"
 
@@ -240,25 +241,22 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def main():
-    # Запускаем health server
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
     logger.info(f"Health server запущен на порту {PORT}")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # /digest без файла
-    app.add_handler(CommandHandler("digest", handle_digest_command))
+    # Обработчик ошибок — подавляет Conflict
+    app.add_error_handler(handle_error)
 
-    # Файл .md — дайджест
+    app.add_handler(CommandHandler("digest", handle_digest_command))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
     app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
-
-    # Ссылка — резюме статьи
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("Бот запущен!")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
