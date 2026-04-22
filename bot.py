@@ -143,7 +143,7 @@ def digest_batch_with_groq(articles: list[dict]) -> dict:
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
 
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
         temperature=0.3,
         max_tokens=4000,
