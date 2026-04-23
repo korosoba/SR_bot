@@ -1,8 +1,11 @@
 import os
+import asyncio
 import logging
 import threading
 import tempfile
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import trafilatura
 from telegram import Update, Document
 from telegram.ext import (
@@ -21,7 +24,14 @@ PORT = int(os.environ.get("PORT", 10000))
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-BATCH_SIZE = 50  # Статей за один запрос к Groq
+BATCH_SIZE = 50
+
+# Настройки ретраев
+MSK = timezone(timedelta(hours=3))
+DEADLINE_HOUR = 20      # до 20:00 МСК
+PHASE_1_INTERVAL = 15   # минут — первые 4 попытки
+PHASE_1_COUNT = 4
+PHASE_2_INTERVAL = 60   # минут — далее каждый час
 
 
 # --- Health server для Render ---
@@ -66,7 +76,7 @@ def process_with_groq(article_text: str) -> str:
 {article_text[:6000]}
 """
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5,
         max_tokens=1024,
@@ -133,11 +143,11 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 Названия статей НЕ переводи.
 
 Вот статьи:
+
 """
 
 
-def digest_batch_with_groq(articles: list[dict]) -> dict:
-    """Обрабатывает один батч статей, возвращает словарь {категория: [строки]}."""
+def digest_batch_with_groq(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
@@ -152,14 +162,12 @@ def digest_batch_with_groq(articles: list[dict]) -> dict:
 
 
 def merge_digests(batch_results: list[str]) -> str:
-    """Склеивает результаты нескольких батчей в один дайджест."""
     categories = {
         "📋 ПОДБОРКИ": [],
         "🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ": [],
         "🏛 КЛАССИКА": [],
         "🌟 ПЕРСОНЫ": [],
     }
-
     current_cat = None
     for result in batch_results:
         for line in result.split("\n"):
@@ -169,32 +177,30 @@ def merge_digests(batch_results: list[str]) -> str:
             if line in categories:
                 current_cat = line
             elif line.startswith("•") and current_cat:
-                # Убираем дубли
                 if line not in categories[current_cat]:
                     categories[current_cat].append(line)
 
-    # Собираем итоговый текст
     parts = []
     for cat, items in categories.items():
         if items:
             parts.append(cat)
             parts.extend(items)
             parts.append("")
-
     return "\n".join(parts).strip()
 
 
 def digest_with_groq(articles: list[dict]) -> tuple[str, int]:
-    """Обрабатывает все статьи батчами, возвращает итоговый дайджест и кол-во батчей."""
     batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
     batch_results = []
-
     for i, batch in enumerate(batches):
         logger.info(f"Обрабатываю батч {i+1}/{len(batches)} ({len(batch)} статей)")
         result = digest_batch_with_groq(batch)
         batch_results.append(result)
-
     return merge_digests(batch_results), len(batches)
+
+
+def is_before_deadline() -> bool:
+    return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
 # --- Error handler ---
@@ -210,7 +216,6 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-
     if not url.startswith("http"):
         await update.message.reply_text(
             "👋 Привет! Отправь ссылку на статью — сделаю краткое резюме на русском.\n"
@@ -220,30 +225,102 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("⏳ Читаю статью...")
     article_text = fetch_article(url)
-
     if not article_text:
         await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
         return
 
     await status_msg.edit_text("🤖 Обрабатываю через Groq...")
 
-    try:
-        result = process_with_groq(article_text)
-    except Exception as e:
-        logger.error(f"Groq error: {e}")
-        await status_msg.edit_text("❌ Ошибка Groq. Попробуй чуть позже.")
-        return
+    # Ретраи для резюме: 6 попыток с паузой 10 секунд
+    last_error = None
+    for attempt in range(1, 7):
+        try:
+            result = process_with_groq(article_text)
+            await status_msg.edit_text(result)
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Groq резюме, попытка {attempt}/6: {e}")
+            if attempt < 6:
+                await status_msg.edit_text(
+                    f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
+                )
+                await asyncio.sleep(10)
 
-    await status_msg.edit_text(result)
+    await status_msg.edit_text(
+        f"❌ Groq недоступен — все 6 попыток не удались.\n"
+        f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
+    )
 
 
 async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📎 Отправь мне md-файл с дайджестом.")
 
 
+async def process_digest_with_retry(
+    bot, chat_id: int, articles: list[dict], date_str: str, status_msg
+):
+    """Обрабатывает дайджест с автоматическими повторными попытками при ошибке Groq."""
+    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
+    attempt = 0
+
+    while True:
+        attempt += 1
+        now_msk = datetime.now(MSK).strftime("%H:%M МСК")
+        logger.info(f"Попытка #{attempt} обработки дайджеста в {now_msk}")
+
+        try:
+            await status_msg.edit_text(
+                f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
+                f"через Groq ({n_batches} запроса)..."
+            )
+            result, n_batches_done = digest_with_groq(articles)
+
+            # Успех — сохраняем и отправляем файл
+            result_filename = f"digest-{date_str}.txt"
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8"
+            ) as out:
+                out.write(result)
+                out_path = out.name
+
+            await status_msg.delete()
+            await bot.send_document(
+                chat_id=chat_id,
+                document=open(out_path, "rb"),
+                filename=result_filename,
+                caption=(
+                    f"✅ Дайджест за {date_str} готов — "
+                    f"{len(articles)} статей (попытка #{attempt})"
+                ),
+            )
+            os.unlink(out_path)
+            return
+
+        except Exception as e:
+            logger.warning(f"Попытка #{attempt} не удалась: {e}")
+
+            pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
+            next_try = datetime.now(MSK) + timedelta(minutes=pause)
+
+            # Проверяем дедлайн
+            if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
+                await status_msg.edit_text(
+                    f"❌ Groq недоступен весь день. Дайджест за {date_str} не получен.\n"
+                    f"Последняя попытка: {now_msk}\n"
+                    f"Ошибка: {str(e)[:200]}"
+                )
+                return
+
+            await status_msg.edit_text(
+                f"⚠️ Попытка #{attempt} не удалась ({now_msk})\n"
+                f"Следующая попытка через {pause} мин."
+            )
+            await asyncio.sleep(pause * 60)
+
+
 async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc: Document = update.message.document
-
     if not doc.file_name.endswith(".md"):
         await update.message.reply_text("❌ Нужен файл формата .md")
         return
@@ -257,42 +334,25 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     with open(tmp_path, "r", encoding="utf-8") as f:
         md_text = f.read()
+    os.unlink(tmp_path)
 
     articles = parse_articles(md_text)
     if not articles:
         await status_msg.edit_text("❌ Не удалось найти статьи в файле.")
         return
 
-    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
-    await status_msg.edit_text(
-        f"🤖 Нашёл {len(articles)} статей, обрабатываю через Groq ({n_batches} запроса)..."
-    )
-
-    try:
-        result, n_batches_done = digest_with_groq(articles)
-    except Exception as e:
-        logger.error(f"Groq digest error: {e}")
-        await status_msg.edit_text("❌ Ошибка Groq. Попробуй чуть позже.")
-        return
-
     date_str = doc.file_name.replace("news-", "").replace(".md", "")
-    result_filename = f"digest-{date_str}.txt"
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, encoding="utf-8"
-    ) as out:
-        out.write(result)
-        out_path = out.name
-
-    await status_msg.delete()
-    await update.message.reply_document(
-        document=open(out_path, "rb"),
-        filename=result_filename,
-        caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей в {n_batches_done} запросах",
+    # Запускаем обработку с ретраями в фоне — бот не зависает
+    asyncio.create_task(
+        process_digest_with_retry(
+            bot=context.bot,
+            chat_id=update.message.chat_id,
+            articles=articles,
+            date_str=date_str,
+            status_msg=status_msg,
+        )
     )
-
-    os.unlink(tmp_path)
-    os.unlink(out_path)
 
 
 def main():
@@ -301,6 +361,7 @@ def main():
     logger.info(f"Health server запущен на порту {PORT}")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_error_handler(handle_error)
     app.add_handler(CommandHandler("digest", handle_digest_command))
     app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
