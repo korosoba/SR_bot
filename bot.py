@@ -369,7 +369,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
     logger.info("Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
