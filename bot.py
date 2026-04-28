@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 import threading
@@ -33,14 +34,56 @@ PHASE_1_INTERVAL = 15   # минут — первые 4 попытки
 PHASE_1_COUNT = 4
 PHASE_2_INTERVAL = 60   # минут — далее каждый час
 
+# Глобальная ссылка на event loop бота — нужна для вызова из HTTP-треда
+bot_loop: asyncio.AbstractEventLoop = None
+bot_app = None
 
-# --- Health server для Render ---
+
+# --- Health + Process сервер для Render ---
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b"Bot is alive!")
+
+    def do_POST(self):
+        if self.path == "/process":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                data = json.loads(body)
+
+                md_text = data.get("text", "")
+                date_str = data.get("date", "")
+                chat_id = int(data.get("chat_id", 0))
+
+                if not md_text or not date_str or not chat_id:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Missing fields")
+                    return
+
+                logger.info(f"Получен запрос /process: дата={date_str}, chat_id={chat_id}")
+
+                # Запускаем обработку в event loop бота
+                asyncio.run_coroutine_threadsafe(
+                    process_digest_external(md_text, date_str, chat_id),
+                    bot_loop
+                )
+
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            except Exception as e:
+                logger.error(f"Ошибка в /process: {e}")
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, format, *args):
         pass
@@ -147,7 +190,7 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def _batch_with_groq(articles: list[dict]) -> str:
+def digest_batch_with_groq(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
@@ -203,66 +246,21 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
-# --- Error handler ---
-
-async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(context.error, Conflict):
-        logger.warning("Конфликт инстансов — ожидаем завершения старого...")
-        return
-    logger.error(f"Ошибка: {context.error}")
-
-
-# --- Handlers ---
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text(
-            "👋 Привет! Отправь ссылку на статью — сделаю краткое резюме на русском.\n"
-            "Или отправь md-файл для обработки дайджеста."
-        )
-        return
-
-    status_msg = await update.message.reply_text("⏳ Читаю статью...")
-    article_text = fetch_article(url)
-    if not article_text:
-        await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
-        return
-
-    await status_msg.edit_text("🤖 Обрабатываю через Groq...")
-
-    # Ретраи для резюме: 6 попыток с паузой 10 секунд
-    last_error = None
-    for attempt in range(1, 7):
-        try:
-            result = process_with_groq(article_text)
-            await status_msg.edit_text(result)
-            return
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Groq резюме, попытка {attempt}/6: {e}")
-            if attempt < 6:
-                await status_msg.edit_text(
-                    f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
-                )
-                await asyncio.sleep(10)
-
-    await status_msg.edit_text(
-        f"❌ Groq недоступен — все 6 попыток не удались.\n"
-        f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
-    )
-
-
-async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📎 Отправь мне md-файл с дайджестом.")
-
+# --- Обработка дайджеста с ретраями ---
 
 async def process_digest_with_retry(
-    bot, chat_id: int, articles: list[dict], date_str: str, status_msg
+    bot, chat_id: int, articles: list[dict], date_str: str, status_msg=None
 ):
     """Обрабатывает дайджест с автоматическими повторными попытками при ошибке Groq."""
     n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
     attempt = 0
+
+    # Если вызвано из HTTP (без status_msg) — отправляем обычное сообщение
+    if status_msg is None:
+        status_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"🗞 Получена сводка за {date_str} ({len(articles)} статей). Начинаю обработку..."
+        )
 
     while True:
         attempt += 1
@@ -319,8 +317,81 @@ async def process_digest_with_retry(
             await asyncio.sleep(pause * 60)
 
 
+async def process_digest_external(md_text: str, date_str: str, chat_id: int):
+    """Точка входа для вызова из HTTP-эндпоинта /process."""
+    articles = parse_articles(md_text)
+    if not articles:
+        logger.warning("/process: статьи не найдены в переданном тексте")
+        await bot_app.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Не удалось найти статьи в файле за {date_str}."
+        )
+        return
+
+    logger.info(f"/process: найдено {len(articles)} статей, запускаю обработку")
+    await process_digest_with_retry(
+        bot=bot_app.bot,
+        chat_id=chat_id,
+        articles=articles,
+        date_str=date_str,
+        status_msg=None,
+    )
+
+
+# --- Error handler ---
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        logger.warning("Конфликт инстансов — ожидаем завершения старого...")
+        return
+    logger.error(f"Ошибка: {context.error}")
+
+
+# --- Telegram Handlers ---
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if not url.startswith("http"):
+        await update.message.reply_text(
+            "👋 Привет! Отправь ссылку на статью — сделаю краткое резюме на русском.\n"
+            "Или отправь md-файл для обработки дайджеста."
+        )
+        return
+
+    status_msg = await update.message.reply_text("⏳ Читаю статью...")
+    article_text = fetch_article(url)
+    if not article_text:
+        await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
+        return
+
+    await status_msg.edit_text("🤖 Обрабатываю через Groq...")
+
+    last_error = None
+    for attempt in range(1, 7):
+        try:
+            result = process_with_groq(article_text)
+            await status_msg.edit_text(result)
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Groq резюме, попытка {attempt}/6: {e}")
+            if attempt < 6:
+                await status_msg.edit_text(
+                    f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
+                )
+                await asyncio.sleep(10)
+
+    await status_msg.edit_text(
+        f"❌ Groq недоступен — все 6 попыток не удались.\n"
+        f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
+    )
+
+
+async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📎 Отправь мне md-файл с дайджестом.")
+
+
 async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Получен файл: {update.message.document.file_name} от chat_id={update.message.chat_id}")
     doc: Document = update.message.document
     if not doc.file_name.endswith(".md"):
         await update.message.reply_text("❌ Нужен файл формата .md")
@@ -344,7 +415,6 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     date_str = doc.file_name.replace("news-", "").replace(".md", "")
 
-    # Запускаем обработку с ретраями в фоне — бот не зависает
     asyncio.create_task(
         process_digest_with_retry(
             bot=context.bot,
@@ -357,20 +427,26 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def main():
+    global bot_loop, bot_app
+
+    # Запускаем HTTP-сервер в фоновом треде
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
     logger.info(f"Health server запущен на порту {PORT}")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_error_handler(handle_error)
-    app.add_handler(CommandHandler("digest", handle_digest_command))
-    app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    bot_app.add_error_handler(handle_error)
+    bot_app.add_handler(CommandHandler("digest", handle_digest_command))
+    bot_app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
+    bot_app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+
+    # Сохраняем ссылку на event loop — нужна для вызова из HTTP-треда
+    bot_loop = asyncio.get_event_loop()
 
     logger.info("Бот запущен!")
-    app.run_polling(drop_pending_updates=False)
+    bot_app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
