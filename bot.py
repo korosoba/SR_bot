@@ -147,7 +147,7 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def digest_batch_with_groq(articles: list[dict]) -> str:
+def _batch_with_groq(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
@@ -320,6 +320,7 @@ async def process_digest_with_retry(
 
 
 async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Получен файл: {update.message.document.file_name} от chat_id={update.message.chat_id}")
     doc: Document = update.message.document
     if not doc.file_name.endswith(".md"):
         await update.message.reply_text("❌ Нужен файл формата .md")
