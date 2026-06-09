@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import trafilatura
-import google.generativeai as genai
+from mistralai import Mistral
 from telegram import Update, Document
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -20,13 +20,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
 PORT = int(os.environ.get("PORT", 10000))
 
-genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel("gemini-2.0-flash")
+mistral = Mistral(api_key=MISTRAL_API_KEY)
+MISTRAL_MODEL = "mistral-small-latest"
 
 BATCH_SIZE = 50
+BATCH_PAUSE = 35  # секунд между батчами — лимит 2 RPM на бесплатном тарифе
 
 # Настройки ретраев
 MSK = timezone(timedelta(hours=3))
@@ -103,7 +104,7 @@ def fetch_article(url: str):
     return trafilatura.extract(downloaded)
 
 
-def process_with_gemini(article_text: str) -> str:
+def process_with_mistral(article_text: str) -> str:
     prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
 
 Твоя задача:
@@ -118,8 +119,13 @@ def process_with_gemini(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-    response = gemini.generate_content(prompt)
-    return response.text
+    response = mistral.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5,
+        max_tokens=1024,
+    )
+    return response.choices[0].message.content
 
 
 # --- Обработка дайджеста ---
@@ -185,13 +191,18 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def digest_batch_with_gemini(articles: list[dict]) -> str:
+def digest_batch_with_mistral(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
 
-    response = gemini.generate_content(DIGEST_PROMPT + articles_text)
-    return response.text
+    response = mistral.chat.complete(
+        model=MISTRAL_MODEL,
+        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
+        temperature=0.3,
+        max_tokens=4000,
+    )
+    return response.choices[0].message.content
 
 
 def merge_digests(batch_results: list[str]) -> str:
@@ -222,13 +233,18 @@ def merge_digests(batch_results: list[str]) -> str:
     return "\n".join(parts).strip()
 
 
-def digest_with_gemini(articles: list[dict]) -> tuple[str, int]:
+def digest_with_mistral(articles: list[dict]) -> tuple[str, int]:
     batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
     batch_results = []
     for i, batch in enumerate(batches):
         logger.info(f"Обрабатываю батч {i+1}/{len(batches)} ({len(batch)} статей)")
-        result = digest_batch_with_gemini(batch)
+        result = digest_batch_with_mistral(batch)
         batch_results.append(result)
+        # Пауза между батчами чтобы не превышать 2 RPM
+        if i < len(batches) - 1:
+            logger.info(f"Пауза {BATCH_PAUSE} сек перед следующим батчем...")
+            import time
+            time.sleep(BATCH_PAUSE)
     return merge_digests(batch_results), len(batches)
 
 
@@ -255,12 +271,15 @@ async def process_digest_with_retry(
         now_msk = datetime.now(MSK).strftime("%H:%M МСК")
         logger.info(f"Попытка #{attempt} обработки дайджеста в {now_msk}")
 
+        # Считаем примерное время: n_batches батчей + паузы между ними
+        est_minutes = (n_batches * 35) // 60 + 1
+
         try:
             await status_msg.edit_text(
                 f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
-                f"через Gemini ({n_batches} запроса)..."
+                f"через Mistral ({n_batches} батчей, ~{est_minutes} мин)..."
             )
-            result, n_batches_done = digest_with_gemini(articles)
+            result, n_batches_done = digest_with_mistral(articles)
 
             result_filename = f"digest-{date_str}.txt"
             with tempfile.NamedTemporaryFile(
@@ -290,7 +309,7 @@ async def process_digest_with_retry(
 
             if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
                 await status_msg.edit_text(
-                    f"❌ Gemini недоступен весь день. Дайджест за {date_str} не получен.\n"
+                    f"❌ Mistral недоступен весь день. Дайджест за {date_str} не получен.\n"
                     f"Последняя попытка: {now_msk}\n"
                     f"Ошибка: {str(e)[:200]}"
                 )
@@ -349,17 +368,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
         return
 
-    await status_msg.edit_text("🤖 Обрабатываю через Gemini...")
+    await status_msg.edit_text("🤖 Обрабатываю через Mistral...")
 
     last_error = None
     for attempt in range(1, 7):
         try:
-            result = process_with_gemini(article_text)
+            result = process_with_mistral(article_text)
             await status_msg.edit_text(result)
             return
         except Exception as e:
             last_error = e
-            logger.warning(f"Gemini резюме, попытка {attempt}/6: {e}")
+            logger.warning(f"Mistral резюме, попытка {attempt}/6: {e}")
             if attempt < 6:
                 await status_msg.edit_text(
                     f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
@@ -367,7 +386,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(10)
 
     await status_msg.edit_text(
-        f"❌ Gemini недоступен — все 6 попыток не удались.\n"
+        f"❌ Mistral недоступен — все 6 попыток не удались.\n"
         f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
     )
 
