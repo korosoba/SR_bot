@@ -7,8 +7,8 @@ import tempfile
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import requests
 import trafilatura
-from mistralai import Mistral
 from telegram import Update, Document
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
@@ -23,8 +23,27 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
 PORT = int(os.environ.get("PORT", 10000))
 
-mistral = Mistral(api_key=MISTRAL_API_KEY)
 MISTRAL_MODEL = "mistral-small-latest"
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+
+
+def mistral_request(messages: list, temperature: float = 0.3, max_tokens: int = 4000) -> str:
+    response = requests.post(
+        MISTRAL_URL,
+        headers={
+            "Authorization": f"Bearer {MISTRAL_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MISTRAL_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
 
 BATCH_SIZE = 50
 BATCH_PAUSE = 35  # секунд между батчами — лимит 2 RPM на бесплатном тарифе
@@ -119,13 +138,11 @@ def process_with_mistral(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-    response = mistral.chat.complete(
-        model=MISTRAL_MODEL,
+    return mistral_request(
         messages=[{"role": "user", "content": prompt}],
         temperature=0.5,
         max_tokens=1024,
     )
-    return response.choices[0].message.content
 
 
 # --- Обработка дайджеста ---
@@ -196,13 +213,11 @@ def digest_batch_with_mistral(articles: list[dict]) -> str:
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
 
-    response = mistral.chat.complete(
-        model=MISTRAL_MODEL,
+    return mistral_request(
         messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
         temperature=0.3,
         max_tokens=4000,
     )
-    return response.choices[0].message.content
 
 
 def merge_digests(batch_results: list[str]) -> str:
