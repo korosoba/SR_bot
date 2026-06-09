@@ -8,38 +8,39 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import trafilatura
+import google.generativeai as genai
 from telegram import Update, Document
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler,
     filters, ContextTypes
 )
 from telegram.error import Conflict
-from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 PORT = int(os.environ.get("PORT", 10000))
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+gemini = genai.GenerativeModel("gemini-2.0-flash")
 
 BATCH_SIZE = 50
 
 # Настройки ретраев
 MSK = timezone(timedelta(hours=3))
-DEADLINE_HOUR = 20      # до 20:00 МСК
+DEADLINE_HOUR = 20
 PHASE_1_INTERVAL = 15   # минут — первые 4 попытки
 PHASE_1_COUNT = 4
 PHASE_2_INTERVAL = 60   # минут — далее каждый час
 
-# Глобальная ссылка на event loop бота — нужна для вызова из HTTP-треда
+# Глобальная ссылка на event loop и app бота
 bot_loop: asyncio.AbstractEventLoop = None
 bot_app = None
 
 
-# --- Health + Process сервер для Render ---
+# --- Health + Process сервер ---
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -66,7 +67,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
                 logger.info(f"Получен запрос /process: дата={date_str}, chat_id={chat_id}")
 
-                # Запускаем обработку в event loop бота
                 asyncio.run_coroutine_threadsafe(
                     process_digest_external(md_text, date_str, chat_id),
                     bot_loop
@@ -94,7 +94,7 @@ def run_health_server():
     server.serve_forever()
 
 
-# --- Парсинг и обработка статьи по ссылке ---
+# --- Работа со статьями по ссылке ---
 
 def fetch_article(url: str):
     downloaded = trafilatura.fetch_url(url)
@@ -103,7 +103,7 @@ def fetch_article(url: str):
     return trafilatura.extract(downloaded)
 
 
-def process_with_groq(article_text: str) -> str:
+def process_with_gemini(article_text: str) -> str:
     prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
 
 Твоя задача:
@@ -118,13 +118,8 @@ def process_with_groq(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-    response = groq_client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=1024,
-    )
-    return response.choices[0].message.content
+    response = gemini.generate_content(prompt)
+    return response.text
 
 
 # --- Обработка дайджеста ---
@@ -190,18 +185,13 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def digest_batch_with_groq(articles: list[dict]) -> str:
+def digest_batch_with_gemini(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
 
-    response = groq_client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
-        temperature=0.3,
-        max_tokens=4000,
-    )
-    return response.choices[0].message.content
+    response = gemini.generate_content(DIGEST_PROMPT + articles_text)
+    return response.text
 
 
 def merge_digests(batch_results: list[str]) -> str:
@@ -232,12 +222,12 @@ def merge_digests(batch_results: list[str]) -> str:
     return "\n".join(parts).strip()
 
 
-def digest_with_groq(articles: list[dict]) -> tuple[str, int]:
+def digest_with_gemini(articles: list[dict]) -> tuple[str, int]:
     batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
     batch_results = []
     for i, batch in enumerate(batches):
         logger.info(f"Обрабатываю батч {i+1}/{len(batches)} ({len(batch)} статей)")
-        result = digest_batch_with_groq(batch)
+        result = digest_batch_with_gemini(batch)
         batch_results.append(result)
     return merge_digests(batch_results), len(batches)
 
@@ -251,11 +241,9 @@ def is_before_deadline() -> bool:
 async def process_digest_with_retry(
     bot, chat_id: int, articles: list[dict], date_str: str, status_msg=None
 ):
-    """Обрабатывает дайджест с автоматическими повторными попытками при ошибке Groq."""
     n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
     attempt = 0
 
-    # Если вызвано из HTTP (без status_msg) — отправляем обычное сообщение
     if status_msg is None:
         status_msg = await bot.send_message(
             chat_id=chat_id,
@@ -270,11 +258,10 @@ async def process_digest_with_retry(
         try:
             await status_msg.edit_text(
                 f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
-                f"через Groq ({n_batches} запроса)..."
+                f"через Gemini ({n_batches} запроса)..."
             )
-            result, n_batches_done = digest_with_groq(articles)
+            result, n_batches_done = digest_with_gemini(articles)
 
-            # Успех — сохраняем и отправляем файл
             result_filename = f"digest-{date_str}.txt"
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".txt", delete=False, encoding="utf-8"
@@ -301,10 +288,9 @@ async def process_digest_with_retry(
             pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
             next_try = datetime.now(MSK) + timedelta(minutes=pause)
 
-            # Проверяем дедлайн
             if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
                 await status_msg.edit_text(
-                    f"❌ Groq недоступен весь день. Дайджест за {date_str} не получен.\n"
+                    f"❌ Gemini недоступен весь день. Дайджест за {date_str} не получен.\n"
                     f"Последняя попытка: {now_msk}\n"
                     f"Ошибка: {str(e)[:200]}"
                 )
@@ -318,7 +304,6 @@ async def process_digest_with_retry(
 
 
 async def process_digest_external(md_text: str, date_str: str, chat_id: int):
-    """Точка входа для вызова из HTTP-эндпоинта /process."""
     articles = parse_articles(md_text)
     if not articles:
         logger.warning("/process: статьи не найдены в переданном тексте")
@@ -364,17 +349,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
         return
 
-    await status_msg.edit_text("🤖 Обрабатываю через Groq...")
+    await status_msg.edit_text("🤖 Обрабатываю через Gemini...")
 
     last_error = None
     for attempt in range(1, 7):
         try:
-            result = process_with_groq(article_text)
+            result = process_with_gemini(article_text)
             await status_msg.edit_text(result)
             return
         except Exception as e:
             last_error = e
-            logger.warning(f"Groq резюме, попытка {attempt}/6: {e}")
+            logger.warning(f"Gemini резюме, попытка {attempt}/6: {e}")
             if attempt < 6:
                 await status_msg.edit_text(
                     f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
@@ -382,7 +367,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(10)
 
     await status_msg.edit_text(
-        f"❌ Groq недоступен — все 6 попыток не удались.\n"
+        f"❌ Gemini недоступен — все 6 попыток не удались.\n"
         f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
     )
 
@@ -429,7 +414,6 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def main():
     global bot_loop, bot_app
 
-    # Запускаем HTTP-сервер в фоновом треде
     thread = threading.Thread(target=run_health_server, daemon=True)
     thread.start()
     logger.info(f"Health server запущен на порту {PORT}")
@@ -442,7 +426,6 @@ def main():
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
-    # Сохраняем ссылку на event loop — нужна для вызова из HTTP-треда
     bot_loop = asyncio.get_event_loop()
 
     logger.info("Бот запущен!")
