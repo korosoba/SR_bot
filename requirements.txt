@@ -1,3 +1,7 @@
-python-telegram-bot==21.3
-trafilatura
-requests
+flask==3.0.3
+gunicorn==22.0.0
+python-telegram-bot==21.6
+requests==2.32.3
+trafilatura==1.12.2
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
