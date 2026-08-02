@@ -37,7 +37,6 @@ PHASE_1_INTERVAL = 15
 PHASE_1_COUNT = 4
 PHASE_2_INTERVAL = 60
 
-# Глобальные — нужны для доступа из app.py
 _bot_loop: asyncio.AbstractEventLoop = None
 _bot_app = None
 
@@ -125,7 +124,7 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 - ПРОПУСТИТЬ (не включать): новости, анонсы, игры, техника, аниме, комиксы, статьи об индустрии (сборы, рейтинги, бизнес)
 - 📋 ПОДБОРКИ: статьи формата "Лучшие X...", "10 лучших...", рейтинги, списки фильмов/сериалов
 - 🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ: статьи о фильмах/сериалах вышедших примерно в последние 1-3 года (НЕ рецензии, НЕ подборки)
-- 🏛 КЛАССИКА: статьи о фильмах/сериалах вышедших 10 и более лет назад (ключевые слова: "X years later", "classic", "cult", старые названия)
+- 🏛 КЛАССИКА: статьи о фильмах/сериалах вышедших 10 и более лет назад
 - 🌟 ПЕРСОНЫ: статьи о конкретных актёрах, режиссёрах, других интересных людях
 
 ВАЖНО:
@@ -133,7 +132,7 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 - Одна статья может попасть только в одну категорию
 - Статьи о персонах (актёрах) включай в ПЕРСОНЫ, даже если они про старый фильм
 
-ФОРМАТ ОТВЕТА — строго такой, каждая категория на новой строке:
+ФОРМАТ ОТВЕТА:
 
 📋 ПОДБОРКИ
 • [Название статьи](ссылка)
@@ -360,6 +359,16 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def _run_polling():
+    """Запускает polling вручную — без сигнальных хендлеров, безопасно в потоке."""
+    async with _bot_app:
+        await _bot_app.updater.start_polling(drop_pending_updates=False)
+        await _bot_app.start()
+        logger.info("SR_bot (news) polling запущен!")
+        while True:
+            await asyncio.sleep(3600)
+
+
 def start_news_bot():
     """Запускается в отдельном потоке из app.py."""
     global _bot_loop, _bot_app
@@ -374,5 +383,5 @@ def start_news_bot():
     _bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_bot_loop)
 
-    logger.info("SR_bot (news) запущен!")
-    _bot_app.run_polling(drop_pending_updates=False)
+    logger.info("SR_bot thread: запускаю event loop...")
+    _bot_loop.run_until_complete(_run_polling())
