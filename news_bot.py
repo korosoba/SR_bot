@@ -28,6 +28,9 @@ MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
 MISTRAL_MODEL = "mistral-small-latest"
 MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
+VK_TOKEN = os.getenv("VK_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")  # числовой ID группы без минуса
+
 BATCH_SIZE = 50
 BATCH_PAUSE = 35
 
@@ -209,6 +212,44 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
+def publish_to_vk(text: str, date_str: str) -> bool:
+    """Публикует дайджест в закрытую VK-группу. Возвращает True если успешно."""
+    if not VK_TOKEN or not VK_GROUP_ID:
+        logger.info("VK не настроен, пропускаю публикацию")
+        return False
+
+    # VK принимает только текст без markdown-ссылок — конвертируем [текст](url) → текст: url
+    import re
+    vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
+    vk_text = f"📰 Дайджест за {date_str}\n\n{vk_text}"
+
+    # VK ограничивает пост 20 000 символов
+    vk_text = vk_text[:20000]
+
+    try:
+        import urllib.request
+        import urllib.parse
+        url = "https://api.vk.com/method/wall.post"
+        params = urllib.parse.urlencode({
+            "owner_id": f"-{VK_GROUP_ID}",  # минус = группа
+            "message": vk_text,
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }).encode()
+        req = urllib.request.Request(url, data=params)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            if "error" in result:
+                logger.error(f"VK API error: {result['error']}")
+                return False
+            post_id = result.get("response", {}).get("post_id")
+            logger.info(f"✅ VK: опубликован пост {post_id}")
+            return True
+    except Exception as e:
+        logger.error(f"VK публикация не удалась: {e}")
+        return False
+
+
 async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
     n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
     attempt = 0
@@ -244,6 +285,14 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
                 caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей (попытка #{attempt})",
             )
             os.unlink(out_path)
+
+            # Параллельно публикуем в VK (если настроено)
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="📌 Дайджест также опубликован в VK-группе"
+                )
             return
 
         except Exception as e:
