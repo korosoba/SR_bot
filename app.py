@@ -183,18 +183,14 @@ def index():
     return {"status": "running", "bots": ["SR_bot", "CinemaPostBot"]}, 200
 
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
+# ── Запуск новостного бота при старте модуля ─────────────────────────────────
+# Запускаем здесь, а не в main() — чтобы gunicorn тоже подхватил поток
 
-def main():
-    # Запускаем новостной бот в отдельном потоке
-    news_thread = threading.Thread(target=start_news_bot, daemon=True)
-    news_thread.start()
-    logger.info("SR_bot запущен в отдельном потоке")
-
-    # Flask запускается основным процессом через gunicorn
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+news_thread = threading.Thread(target=start_news_bot, daemon=True)
+news_thread.start()
+logger.info("SR_bot запущен в отдельном потоке")
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
