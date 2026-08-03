@@ -159,9 +159,20 @@ def process():
 
         logger.info(f"/process: дата={date_str}, chat_id={chat_id}")
 
+        # Ждём пока news_bot инициализирует event loop (до 30 сек)
+        import time
+        for _ in range(30):
+            loop = get_bot_loop()
+            if loop is not None:
+                break
+            time.sleep(1)
+        else:
+            logger.error("Bot loop не инициализирован после 30 сек ожидания")
+            return Response("Bot not ready", status=503)
+
         asyncio.run_coroutine_threadsafe(
             process_digest_external(md_text, date_str, chat_id),
-            get_bot_loop()
+            loop
         )
 
         return Response("OK", status=200)
