@@ -236,18 +236,38 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
         est_minutes = (n_batches * 35) // 60 + 1
 
         try:
-            await status_msg.edit_text(
-                f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
-                f"({n_batches} батчей, ~{est_minutes} мин)..."
-            )
+            try:
+                await status_msg.edit_text(
+                    f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
+                    f"({n_batches} батчей, ~{est_minutes} мин)..."
+                )
+            except Exception:
+                pass  # сообщение уже удалено — не критично
+
             result, _ = digest_with_mistral(articles)
+
+            # Если Mistral отфильтровал все статьи — результат пустой
+            if not result.strip():
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"ℹ️ Дайджест за {date_str}: все статьи отфильтрованы, нечего публиковать."
+                )
+                return
 
             result_filename = f"digest-{date_str}.txt"
             with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as out:
                 out.write(result)
                 out_path = out.name
 
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
             await bot.send_document(
                 chat_id=chat_id,
                 document=open(out_path, "rb"),
@@ -255,6 +275,14 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
                 caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей (попытка #{attempt})",
             )
             os.unlink(out_path)
+
+            # Публикуем в VK если настроено
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="📌 Дайджест также опубликован в VK-группе"
+                )
             return
 
         except Exception as e:
@@ -263,15 +291,21 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
             next_try = datetime.now(MSK) + timedelta(minutes=pause)
 
             if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
-                await status_msg.edit_text(
-                    f"❌ Mistral недоступен весь день. Дайджест за {date_str} не получен.\n"
-                    f"Последняя попытка: {now_msk}\nОшибка: {str(e)[:200]}"
-                )
+                try:
+                    await status_msg.edit_text(
+                        f"❌ Mistral недоступен весь день. Дайджест за {date_str} не получен.\n"
+                        f"Последняя попытка: {now_msk}\nОшибка: {str(e)[:200]}"
+                    )
+                except Exception:
+                    await bot.send_message(chat_id=chat_id, text=f"❌ Дайджест за {date_str} не получен: {str(e)[:200]}")
                 return
 
-            await status_msg.edit_text(
-                f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин."
-            )
+            try:
+                await status_msg.edit_text(
+                    f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин."
+                )
+            except Exception:
+                pass
             await asyncio.sleep(pause * 60)
 
 
