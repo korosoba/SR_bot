@@ -18,7 +18,7 @@ import asyncio
 from flask import Flask, request, Response
 
 # Импорты новостного бота
-from news_bot import start_news_bot, process_digest_external, get_bot_loop
+from news_bot import start_news_bot, process_digest_external, parse_articles, send_digest
 
 # Импорты пост-бота
 from article_parser import parse_article
@@ -159,21 +159,15 @@ def process():
 
         logger.info(f"/process: дата={date_str}, chat_id={chat_id}")
 
-        # Запускаем обработку в отдельном потоке — сразу возвращаем OK
-        def run_in_background():
-            import time
-            for _ in range(60):
-                loop = get_bot_loop()
-                if loop is not None:
-                    asyncio.run_coroutine_threadsafe(
-                        process_digest_external(md_text, date_str, chat_id),
-                        loop
-                    )
-                    return
-                time.sleep(1)
-            logger.error("Bot loop не инициализирован после 60 сек ожидания")
+        # Запускаем обработку в отдельном потоке с собственным event loop
+        def run_digest():
+            articles = parse_articles(md_text)
+            if not articles:
+                logger.error("Не удалось найти статьи в файле")
+                return
+            asyncio.run(send_digest(articles, date_str, chat_id))
 
-        threading.Thread(target=run_in_background, daemon=True).start()
+        threading.Thread(target=run_digest, daemon=True).start()
         return Response("OK", status=200)
 
     except Exception as e:
