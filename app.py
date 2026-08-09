@@ -165,7 +165,7 @@ def process():
             if not articles:
                 logger.error("Не удалось найти статьи в файле")
                 return
-            asyncio.run(send_digest(articles, date_str, chat_id))
+            send_digest(articles, date_str, chat_id)
 
         threading.Thread(target=run_digest, daemon=True).start()
         return Response("OK", status=200)
