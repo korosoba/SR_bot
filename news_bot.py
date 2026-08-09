@@ -209,7 +209,41 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
-def send_digest(articles: list[dict], date_str: str, chat_id: int):
+VK_TOKEN = os.getenv("VK_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+
+
+def publish_to_vk(text: str, date_str: str) -> bool:
+    """Публикует дайджест в закрытую VK-группу. Возвращает True если успешно."""
+    if not VK_TOKEN or not VK_GROUP_ID:
+        logger.info("VK не настроен, пропускаю публикацию")
+        return False
+
+    import re
+    import urllib.request
+    import urllib.parse
+    vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
+    vk_text = f"📰 Дайджест за {date_str}\n\n{vk_text}"
+    vk_text = vk_text[:20000]
+
+    try:
+        params = urllib.parse.urlencode({
+            "owner_id": f"-{VK_GROUP_ID}",
+            "message": vk_text,
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }).encode()
+        req = urllib.request.Request("https://api.vk.com/method/wall.post", data=params)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            if "error" in result:
+                logger.error(f"VK API error: {result['error']}")
+                return False
+            logger.info(f"✅ VK: опубликован пост {result.get('response', {}).get('post_id')}")
+            return True
+    except Exception as e:
+        logger.error(f"VK публикация не удалась: {e}")
+        return False
     """
     Синхронная функция отправки дайджеста через urllib (без python-telegram-bot).
     Вызывается напрямую из потока в app.py — не требует asyncio.run().
