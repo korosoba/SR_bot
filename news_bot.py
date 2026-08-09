@@ -209,15 +209,103 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
-async def send_digest(articles: list[dict], date_str: str, chat_id: int):
+def send_digest(articles: list[dict], date_str: str, chat_id: int):
     """
-    Самостоятельная функция для отправки дайджеста.
-    Создаёт собственный экземпляр бота — не зависит от глобального _bot_loop.
-    Вызывается через asyncio.run() из отдельного потока в app.py.
+    Синхронная функция отправки дайджеста через urllib (без python-telegram-bot).
+    Вызывается напрямую из потока в app.py — не требует asyncio.run().
     """
-    from telegram import Bot
-    bot = Bot(token=TELEGRAM_TOKEN)
-    await process_digest_with_retry(bot=bot, chat_id=chat_id, articles=articles, date_str=date_str)
+    import urllib.request
+    import urllib.parse
+
+    def tg(method, payload):
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    def send_text(text):
+        return tg("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+
+    def edit_text(message_id, text):
+        try:
+            tg("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
+        except Exception:
+            pass
+
+    def delete_msg(message_id):
+        try:
+            tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        except Exception:
+            pass
+
+    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
+    status = send_text(f"🗞 Получена сводка за {date_str} ({len(articles)} статей). Начинаю обработку...")
+    status_id = status["result"]["message_id"]
+    attempt = 0
+
+    while True:
+        attempt += 1
+        est_minutes = (n_batches * 35) // 60 + 1
+        now_msk = datetime.now(MSK).strftime("%H:%M МСК")
+
+        try:
+            edit_text(status_id, f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей ({n_batches} батчей, ~{est_minutes} мин)...")
+            result, _ = digest_with_mistral(articles)
+
+            if not result.strip():
+                delete_msg(status_id)
+                send_text(f"ℹ️ Дайджест за {date_str}: все статьи отфильтрованы, нечего публиковать.")
+                return
+
+            # Отправляем как документ
+            result_filename = f"digest-{date_str}.txt"
+            with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as out:
+                out.write(result.encode("utf-8"))
+                out_path = out.name
+
+            delete_msg(status_id)
+
+            # sendDocument через multipart
+            boundary = "----BotBoundary"
+            caption = f"✅ Дайджест за {date_str} готов — {len(articles)} статей"
+            with open(out_path, "rb") as f:
+                file_data = f.read()
+            os.unlink(out_path)
+
+            body = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{result_filename}\"\r\nContent-Type: text/plain\r\n\r\n"
+            ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                json.loads(resp.read())
+
+            logger.info(f"✅ Дайджест за {date_str} отправлен")
+
+            # VK публикация
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                send_text("📌 Дайджест также опубликован в VK-группе")
+            return
+
+        except Exception as e:
+            logger.warning(f"Попытка #{attempt} не удалась: {e}")
+            pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
+            next_try = datetime.now(MSK) + timedelta(minutes=pause)
+
+            if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
+                edit_text(status_id, f"❌ Дайджест за {date_str} не получен.\nОшибка: {str(e)[:200]}")
+                return
+
+            edit_text(status_id, f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин.")
+            time.sleep(pause * 60)
 
 
 async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
