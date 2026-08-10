@@ -18,7 +18,7 @@ import asyncio
 from flask import Flask, request, Response
 
 # Импорты новостного бота
-from news_bot import start_news_bot, process_digest_external, parse_articles, send_digest
+from news_bot import start_news_bot, parse_articles, send_digest
 
 # Импорты пост-бота
 from article_parser import parse_article
