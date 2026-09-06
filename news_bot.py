@@ -32,7 +32,7 @@ VK_TOKEN = os.getenv("VK_TOKEN", "")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
 
 BATCH_SIZE = 50
-BATCH_PAUSE = 35
+BATCH_PAUSE = 65
 
 MSK = timezone(timedelta(hours=3))
 DEADLINE_HOUR = 20
