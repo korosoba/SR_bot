@@ -23,16 +23,13 @@ from telegram.error import Conflict
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["NEWS_BOT_TOKEN"]
-MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-MISTRAL_MODEL = "mistral-small-latest"
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-
-VK_TOKEN = os.getenv("VK_TOKEN", "")
-VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 BATCH_SIZE = 50
-BATCH_PAUSE = 65
+BATCH_PAUSE = 35
 
 MSK = timezone(timedelta(hours=3))
 DEADLINE_HOUR = 20
@@ -48,23 +45,20 @@ def get_bot_loop():
     return _bot_loop
 
 
-def mistral_request(messages: list, temperature: float = 0.3, max_tokens: int = 4000) -> str:
-    response = requests.post(
-        MISTRAL_URL,
-        headers={
-            "Authorization": f"Bearer {MISTRAL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MISTRAL_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=60,
+def gemini_request(prompt: str, temperature: float = 0.3) -> str:
+    import urllib.request
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 8192},
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def fetch_article(url: str):
@@ -74,7 +68,7 @@ def fetch_article(url: str):
     return trafilatura.extract(downloaded)
 
 
-def process_with_mistral(article_text: str) -> str:
+def process_with_gemini(article_text: str) -> str:
     prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
 
 Твоя задача:
@@ -89,11 +83,7 @@ def process_with_mistral(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-    return mistral_request(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=1024,
-    )
+    return gemini_request(prompt, temperature=0.5)
 
 
 def parse_articles(md_text: str) -> list[dict]:
@@ -157,15 +147,11 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def digest_batch_with_mistral(articles: list[dict]) -> str:
+def digest_batch_with_gemini(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
-    return mistral_request(
-        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
-        temperature=0.3,
-        max_tokens=4000,
-    )
+    return gemini_request(DIGEST_PROMPT + articles_text, temperature=0.3)
 
 
 def merge_digests(batch_results: list[str]) -> str:
@@ -195,12 +181,12 @@ def merge_digests(batch_results: list[str]) -> str:
     return "\n".join(parts).strip()
 
 
-def digest_with_mistral(articles: list[dict]) -> tuple[str, int]:
+def digest_with_gemini(articles: list[dict]) -> tuple[str, int]:
     batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
     batch_results = []
     for i, batch in enumerate(batches):
         logger.info(f"Батч {i+1}/{len(batches)} ({len(batch)} статей)")
-        result = digest_batch_with_mistral(batch)
+        result = digest_batch_with_gemini(batch)
         batch_results.append(result)
         if i < len(batches) - 1:
             logger.info(f"Пауза {BATCH_PAUSE} сек...")
@@ -212,45 +198,13 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
-def publish_to_vk(text: str, date_str: str) -> bool:
-    """Публикует дайджест в закрытую VK-группу. Возвращает True если успешно."""
-    if not VK_TOKEN or not VK_GROUP_ID:
-        logger.info("VK не настроен, пропускаю публикацию")
-        return False
-
-    import re
-    import urllib.request
-    import urllib.parse
-    vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
-    vk_text = f"📰 Дайджест за {date_str}\n\n{vk_text}"
-    vk_text = vk_text[:20000]
-
-    try:
-        params = urllib.parse.urlencode({
-            "owner_id": f"-{VK_GROUP_ID}",
-            "message": vk_text,
-            "access_token": VK_TOKEN,
-            "v": "5.199",
-        }).encode()
-        req = urllib.request.Request("https://api.vk.com/method/wall.post", data=params)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-            if "error" in result:
-                logger.error(f"VK API error: {result['error']}")
-                return False
-            logger.info(f"✅ VK: опубликован пост {result.get('response', {}).get('post_id')}")
-            return True
-    except Exception as e:
-        logger.error(f"VK публикация не удалась: {e}")
-        return False
-
-
 def send_digest(articles: list[dict], date_str: str, chat_id: int):
     """
     Синхронная функция отправки дайджеста через urllib (без python-telegram-bot).
     Вызывается напрямую из потока в app.py — не требует asyncio.run().
     """
     import urllib.request
+    import urllib.parse
 
     def tg(method, payload):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
@@ -286,13 +240,14 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
         try:
             edit_text(status_id, f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей ({n_batches} батчей, ~{est_minutes} мин)...")
-            result, _ = digest_with_mistral(articles)
+            result, _ = digest_with_gemini(articles)
 
             if not result.strip():
                 delete_msg(status_id)
                 send_text(f"ℹ️ Дайджест за {date_str}: все статьи отфильтрованы, нечего публиковать.")
                 return
 
+            # Отправляем как документ
             result_filename = f"digest-{date_str}.txt"
             with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as out:
                 out.write(result.encode("utf-8"))
@@ -300,6 +255,7 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             delete_msg(status_id)
 
+            # sendDocument через multipart
             boundary = "----BotBoundary"
             caption = f"✅ Дайджест за {date_str} готов — {len(articles)} статей"
             with open(out_path, "rb") as f:
@@ -322,6 +278,7 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             logger.info(f"✅ Дайджест за {date_str} отправлен")
 
+            # VK публикация
             vk_ok = publish_to_vk(result, date_str)
             if vk_ok:
                 send_text("📌 Дайджест также опубликован в VK-группе")
@@ -338,6 +295,111 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             edit_text(status_id, f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин.")
             time.sleep(pause * 60)
+
+
+async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
+    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
+    attempt = 0
+
+    if status_msg is None:
+        status_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"🗞 Получена сводка за {date_str} ({len(articles)} статей). Начинаю обработку..."
+        )
+
+    while True:
+        attempt += 1
+        now_msk = datetime.now(MSK).strftime("%H:%M МСК")
+        est_minutes = (n_batches * 35) // 60 + 1
+
+        try:
+            try:
+                await status_msg.edit_text(
+                    f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
+                    f"({n_batches} батчей, ~{est_minutes} мин)..."
+                )
+            except Exception:
+                pass  # сообщение уже удалено — не критично
+
+            result, _ = digest_with_gemini(articles)
+
+            # Если AI отфильтровал все статьи — результат пустой
+            if not result.strip():
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"ℹ️ Дайджест за {date_str}: все статьи отфильтрованы, нечего публиковать."
+                )
+                return
+
+            result_filename = f"digest-{date_str}.txt"
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as out:
+                out.write(result)
+                out_path = out.name
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            await bot.send_document(
+                chat_id=chat_id,
+                document=open(out_path, "rb"),
+                filename=result_filename,
+                caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей (попытка #{attempt})",
+            )
+            os.unlink(out_path)
+
+            # Публикуем в VK если настроено
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="📌 Дайджест также опубликован в VK-группе"
+                )
+            return
+
+        except Exception as e:
+            logger.warning(f"Попытка #{attempt} не удалась: {e}")
+            pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
+            next_try = datetime.now(MSK) + timedelta(minutes=pause)
+
+            if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
+                try:
+                    await status_msg.edit_text(
+                        f"❌ Gemini недоступен весь день. Дайджест за {date_str} не получен.\n"
+                        f"Последняя попытка: {now_msk}\nОшибка: {str(e)[:200]}"
+                    )
+                except Exception:
+                    await bot.send_message(chat_id=chat_id, text=f"❌ Дайджест за {date_str} не получен: {str(e)[:200]}")
+                return
+
+            try:
+                await status_msg.edit_text(
+                    f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин."
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(pause * 60)
+
+
+async def process_digest_external(md_text: str, date_str: str, chat_id: int):
+    articles = parse_articles(md_text)
+    if not articles:
+        await _bot_app.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Не удалось найти статьи в файле за {date_str}."
+        )
+        return
+    await process_digest_with_retry(
+        bot=_bot_app.bot,
+        chat_id=chat_id,
+        articles=articles,
+        date_str=date_str,
+    )
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -362,12 +424,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
         return
 
-    await status_msg.edit_text("🤖 Обрабатываю через Mistral...")
+    await status_msg.edit_text("🤖 Обрабатываю через Gemini...")
 
     last_error = None
     for attempt in range(1, 7):
         try:
-            result = process_with_mistral(article_text)
+            result = process_with_gemini(article_text)
             await status_msg.edit_text(result)
             return
         except Exception as e:
@@ -377,7 +439,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(10)
 
     await status_msg.edit_text(
-        f"❌ Mistral недоступен — все 6 попыток не удались.\nОшибка: {str(last_error)[:200]}"
+        f"❌ Gemini недоступен — все 6 попыток не удались.\nОшибка: {str(last_error)[:200]}"
     )
 
 
@@ -417,85 +479,6 @@ async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
             status_msg=status_msg,
         )
     )
-
-
-async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
-    """Используется при ручной отправке md-файла через Telegram."""
-    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
-    attempt = 0
-
-    if status_msg is None:
-        status_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"🗞 Получена сводка за {date_str} ({len(articles)} статей). Начинаю обработку..."
-        )
-
-    while True:
-        attempt += 1
-        now_msk = datetime.now(MSK).strftime("%H:%M МСК")
-        est_minutes = (n_batches * 35) // 60 + 1
-
-        try:
-            try:
-                await status_msg.edit_text(
-                    f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
-                    f"({n_batches} батчей, ~{est_minutes} мин)..."
-                )
-            except Exception:
-                pass
-
-            result, _ = digest_with_mistral(articles)
-
-            if not result.strip():
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"ℹ️ Дайджест за {date_str}: все статьи отфильтрованы."
-                )
-                return
-
-            result_filename = f"digest-{date_str}.txt"
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as out:
-                out.write(result)
-                out_path = out.name
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            await bot.send_document(
-                chat_id=chat_id,
-                document=open(out_path, "rb"),
-                filename=result_filename,
-                caption=f"✅ Дайджест за {date_str} готов — {len(articles)} статей",
-            )
-            os.unlink(out_path)
-            publish_to_vk(result, date_str)
-            return
-
-        except Exception as e:
-            logger.warning(f"Попытка #{attempt} не удалась: {e}")
-            pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
-            next_try = datetime.now(MSK) + timedelta(minutes=pause)
-
-            if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
-                try:
-                    await status_msg.edit_text(f"❌ Дайджест за {date_str} не получен.\nОшибка: {str(e)[:200]}")
-                except Exception:
-                    await bot.send_message(chat_id=chat_id, text=f"❌ Дайджест за {date_str} не получен.")
-                return
-
-            try:
-                await status_msg.edit_text(
-                    f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин."
-                )
-            except Exception:
-                pass
-            await asyncio.sleep(pause * 60)
 
 
 async def _run_polling():
