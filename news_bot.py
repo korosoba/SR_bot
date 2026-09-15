@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["NEWS_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 BATCH_SIZE = 50
