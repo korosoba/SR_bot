@@ -28,6 +28,9 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
+VK_TOKEN = os.getenv("VK_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+
 BATCH_SIZE = 50
 BATCH_PAUSE = 35
 
@@ -198,6 +201,36 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
+def publish_to_vk(text: str, date_str: str) -> bool:
+    """Публикует дайджест в закрытую VK-группу."""
+    if not VK_TOKEN or not VK_GROUP_ID:
+        logger.info("VK не настроен, пропускаю публикацию")
+        return False
+    import re
+    import urllib.request
+    import urllib.parse
+    vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
+    vk_text = f"📰 Дайджест за {date_str}\n\n{vk_text}"[:20000]
+    try:
+        params = urllib.parse.urlencode({
+            "owner_id": f"-{VK_GROUP_ID}",
+            "message": vk_text,
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }).encode()
+        req = urllib.request.Request("https://api.vk.com/method/wall.post", data=params)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            if "error" in result:
+                logger.error(f"VK API error: {result['error']}")
+                return False
+            logger.info(f"✅ VK: опубликован пост {result.get('response', {}).get('post_id')}")
+            return True
+    except Exception as e:
+        logger.error(f"VK публикация не удалась: {e}")
+        return False
+
+
 def send_digest(articles: list[dict], date_str: str, chat_id: int):
     """
     Синхронная функция отправки дайджеста через urllib (без python-telegram-bot).
@@ -278,12 +311,6 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             logger.info(f"✅ Дайджест за {date_str} отправлен")
 
-            # VK публикация
-            vk_ok = publish_to_vk(result, date_str)
-            if vk_ok:
-                send_text("📌 Дайджест также опубликован в VK-группе")
-            return
-
         except Exception as e:
             logger.warning(f"Попытка #{attempt} не удалась: {e}")
             pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
@@ -295,6 +322,16 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             edit_text(status_id, f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин.")
             time.sleep(pause * 60)
+            continue
+
+        # VK публикация — вне основного try/except, не влияет на retry
+        try:
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                send_text("📌 Дайджест также опубликован в VK-группе")
+        except Exception as vk_err:
+            logger.error(f"VK ошибка: {vk_err}")
+        return
 
 
 async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
