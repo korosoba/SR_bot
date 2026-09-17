@@ -202,30 +202,92 @@ def is_before_deadline() -> bool:
 
 
 def publish_to_vk(text: str, date_str: str) -> bool:
-    """Публикует дайджест в закрытую VK-группу."""
+    """Публикует дайджест в VK-группу: краткий анонс постом + полный текст документом."""
     if not VK_TOKEN or not VK_GROUP_ID:
         logger.info("VK не настроен, пропускаю публикацию")
         return False
+
     import re
     import urllib.request
     import urllib.parse
+
     vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
-    vk_text = f"📰 Дайджест за {date_str}\n\n{vk_text}"[:20000]
+
     try:
-        params = urllib.parse.urlencode({
-            "owner_id": f"-{VK_GROUP_ID}",
-            "message": vk_text,
+        # Шаг 1: получаем адрес для загрузки документа
+        params1 = urllib.parse.urlencode({
+            "group_id": VK_GROUP_ID,
             "access_token": VK_TOKEN,
             "v": "5.199",
         }).encode()
-        req = urllib.request.Request("https://api.vk.com/method/wall.post", data=params)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-            if "error" in result:
-                logger.error(f"VK API error: {result['error']}")
-                return False
-            logger.info(f"✅ VK: опубликован пост {result.get('response', {}).get('post_id')}")
-            return True
+        req1 = urllib.request.Request("https://api.vk.com/method/docs.getUploadServer", data=params1)
+        with urllib.request.urlopen(req1, timeout=30) as resp:
+            upload_data = json.loads(resp.read())
+
+        if "error" in upload_data:
+            logger.error(f"VK getUploadServer error: {upload_data['error']}")
+            return False
+
+        upload_url = upload_data["response"]["upload_url"]
+
+        # Шаг 2: загружаем файл через multipart
+        filename = f"digest-{date_str}.txt"
+        file_content = vk_text.encode("utf-8")
+        boundary = "----VKBoundary"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: text/plain\r\n\r\n"
+        ).encode() + file_content + f"\r\n--{boundary}--\r\n".encode()
+
+        req2 = urllib.request.Request(
+            upload_url, data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        with urllib.request.urlopen(req2, timeout=60) as resp:
+            upload_result = json.loads(resp.read())
+
+        # Шаг 3: сохраняем документ
+        params3 = urllib.parse.urlencode({
+            "file": upload_result.get("file", ""),
+            "title": f"Дайджест за {date_str}",
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }).encode()
+        req3 = urllib.request.Request("https://api.vk.com/method/docs.save", data=params3)
+        with urllib.request.urlopen(req3, timeout=30) as resp:
+            save_result = json.loads(resp.read())
+
+        if "error" in save_result:
+            logger.error(f"VK docs.save error: {save_result['error']}")
+            return False
+
+        doc = save_result["response"]["doc"]
+        attachment = f"doc{doc['owner_id']}_{doc['id']}"
+
+        # Шаг 4: публикуем пост с документом
+        preview_lines = [l for l in vk_text.split("\n") if l.strip()][:6]
+        preview = "\n".join(preview_lines)
+        post_text = f"📰 Дайджест за {date_str}\n\n{preview}\n\n📎 Полная версия — в прикреплённом файле"
+
+        params4 = urllib.parse.urlencode({
+            "owner_id": f"-{VK_GROUP_ID}",
+            "message": post_text[:4096],
+            "attachments": attachment,
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }).encode()
+        req4 = urllib.request.Request("https://api.vk.com/method/wall.post", data=params4)
+        with urllib.request.urlopen(req4, timeout=30) as resp:
+            post_result = json.loads(resp.read())
+
+        if "error" in post_result:
+            logger.error(f"VK wall.post error: {post_result['error']}")
+            return False
+
+        logger.info(f"✅ VK: опубликован пост {post_result.get('response', {}).get('post_id')} с документом")
+        return True
+
     except Exception as e:
         logger.error(f"VK публикация не удалась: {e}")
         return False
