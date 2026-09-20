@@ -175,6 +175,7 @@ def publish_to_vk(post_text: str, image_url, source_url: str) -> bool:
         )
         with urllib.request.urlopen(req4, timeout=15) as resp:
             result = json.loads(resp.read())
+        logger.info(f"VK getWallUploadServer response: {upload_server}")
 
         if "error" in result:
             logger.error(f"VK wall.post error: {result['error']}")
