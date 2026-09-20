@@ -1,470 +1,269 @@
+"""
+Telegram bot: receives a URL, returns a ready-to-publish post with image.
+Deployed on Render as a Web Service (webhook mode).
+Only responds to ALLOWED_USER_ID for security.
+"""
+
 import os
-import json
-import asyncio
 import logging
-import threading
-import tempfile
-from datetime import datetime, timezone, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.request
+import urllib.parse
+import json
 
-import requests
-import trafilatura
-from telegram import Update, Document
-from telegram.ext import (
-    ApplicationBuilder, MessageHandler, CommandHandler,
-    filters, ContextTypes
+from flask import Flask, request, Response
+
+from article_parser import parse_article
+from post_generator import generate_post
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
-from telegram.error import Conflict
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
-PORT = int(os.environ.get("PORT", 10000))
+app = Flask(__name__)
 
-MISTRAL_MODEL = "mistral-small-latest"
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+VK_TOKEN = os.getenv("VK_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-def mistral_request(messages: list, temperature: float = 0.3, max_tokens: int = 4000) -> str:
-    response = requests.post(
-        MISTRAL_URL,
-        headers={
-            "Authorization": f"Bearer {MISTRAL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MISTRAL_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=60,
+# ── Telegram API helpers ──────────────────────────────────────────────────────
+
+def tg_send(method: str, payload: dict):
+    url = f"{API_BASE}/{method}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"}
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
-
-BATCH_SIZE = 50
-BATCH_PAUSE = 35  # секунд между батчами — лимит 2 RPM на бесплатном тарифе
-
-# Настройки ретраев
-MSK = timezone(timedelta(hours=3))
-DEADLINE_HOUR = 20
-PHASE_1_INTERVAL = 15   # минут — первые 4 попытки
-PHASE_1_COUNT = 4
-PHASE_2_INTERVAL = 60   # минут — далее каждый час
-
-# Глобальная ссылка на event loop и app бота
-bot_loop: asyncio.AbstractEventLoop = None
-bot_app = None
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
 
 
-# --- Health + Process сервер ---
+def send_message(chat_id: int, text: str):
+    tg_send("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    })
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
 
-    def do_POST(self):
-        if self.path == "/process":
+def send_photo_with_caption(chat_id: int, image_url: str, caption: str):
+    tg_send("sendPhoto", {
+        "chat_id": chat_id,
+        "photo": image_url,
+        "caption": caption,
+        "parse_mode": "HTML",
+    })
+
+
+def send_post(chat_id: int, post_text: str, image_url: str | None, source_url: str):
+    full_text = f"{post_text}\n\n🔗 <a href=\"{source_url}\">Источник</a>"
+
+    if image_url:
+        try:
+            caption = full_text[:1024]
+            send_photo_with_caption(chat_id, image_url, caption)
+            if len(full_text) > 1024:
+                send_message(chat_id, full_text[1024:])
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send photo ({e}), falling back to text only")
+
+    send_message(chat_id, full_text[:4096])
+
+
+# ── VK API helper ─────────────────────────────────────────────────────────────
+
+def publish_to_vk(post_text: str, image_url: str | None, source_url: str) -> bool:
+    """Публикует пост в VK-группу с картинкой если есть."""
+    if not VK_TOKEN or not VK_GROUP_ID:
+        logger.info("VK не настроен, пропускаю")
+        return False
+
+    # Очищаем HTML-теги для VK
+    import re
+    clean_text = re.sub(r'<[^>]+>', '', post_text)
+    vk_text = f"{clean_text}\n\n🔗 {source_url}"
+
+    try:
+        attachments = ""
+
+        # Если есть картинка — загружаем на VK
+        if image_url:
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length).decode("utf-8")
-                data = json.loads(body)
-
-                md_text = data.get("text", "")
-                date_str = data.get("date", "")
-                chat_id = int(data.get("chat_id", 0))
-
-                if not md_text or not date_str or not chat_id:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"Missing fields")
-                    return
-
-                logger.info(f"Получен запрос /process: дата={date_str}, chat_id={chat_id}")
-
-                asyncio.run_coroutine_threadsafe(
-                    process_digest_external(md_text, date_str, chat_id),
-                    bot_loop
+                # Шаг 1: получаем адрес для загрузки фото на стену
+                params1 = urllib.parse.urlencode({
+                    "group_id": VK_GROUP_ID,
+                    "access_token": VK_TOKEN,
+                    "v": "5.199",
+                }).encode()
+                req1 = urllib.request.Request(
+                    "https://api.vk.com/method/photos.getWallUploadServer",
+                    data=params1
                 )
+                with urllib.request.urlopen(req1, timeout=15) as resp:
+                    upload_server = json.loads(resp.read())
 
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"OK")
+                upload_url = upload_server["response"]["upload_url"]
+
+                # Шаг 2: скачиваем картинку и загружаем на VK
+                with urllib.request.urlopen(image_url, timeout=15) as img_resp:
+                    img_data = img_resp.read()
+
+                boundary = "----VKPhotoBoundary"
+                body = (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="photo"; filename="photo.jpg"\r\n'
+                    f"Content-Type: image/jpeg\r\n\r\n"
+                ).encode() + img_data + f"\r\n--{boundary}--\r\n".encode()
+
+                req2 = urllib.request.Request(
+                    upload_url, data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+                )
+                with urllib.request.urlopen(req2, timeout=30) as resp:
+                    upload_result = json.loads(resp.read())
+
+                # Шаг 3: сохраняем фото
+                params3 = urllib.parse.urlencode({
+                    "group_id": VK_GROUP_ID,
+                    "photo": upload_result.get("photo", ""),
+                    "server": upload_result.get("server", ""),
+                    "hash": upload_result.get("hash", ""),
+                    "access_token": VK_TOKEN,
+                    "v": "5.199",
+                }).encode()
+                req3 = urllib.request.Request(
+                    "https://api.vk.com/method/photos.saveWallPhoto",
+                    data=params3
+                )
+                with urllib.request.urlopen(req3, timeout=15) as resp:
+                    save_result = json.loads(resp.read())
+
+                photo = save_result["response"][0]
+                attachments = f"photo{photo['owner_id']}_{photo['id']}"
+                logger.info("✅ VK: фото загружено")
 
             except Exception as e:
-                logger.error(f"Ошибка в /process: {e}")
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(e).encode())
-        else:
-            self.send_response(404)
-            self.end_headers()
+                logger.warning(f"VK фото не загрузилось ({e}), публикую без картинки")
 
-    def log_message(self, format, *args):
-        pass
+        # Шаг 4: публикуем пост
+        post_params = {
+            "owner_id": f"-{VK_GROUP_ID}",
+            "message": vk_text[:4096],
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        }
+        if attachments:
+            post_params["attachments"] = attachments
 
-
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
-
-# --- Работа со статьями по ссылке ---
-
-def fetch_article(url: str):
-    downloaded = trafilatura.fetch_url(url)
-    if not downloaded:
-        return None
-    return trafilatura.extract(downloaded)
-
-
-def process_with_mistral(article_text: str) -> str:
-    prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
-
-Твоя задача:
-1. Сделай краткое резюме статьи (5-7 предложений), выдели главные мысли
-2. Переведи это резюме на русский язык
-
-Отвечай ТОЛЬКО на русском языке. Формат ответа:
-
-📌 Краткое резюме:
-[текст резюме на русском]
-
-Статья:
-{article_text[:6000]}
-"""
-    return mistral_request(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=1024,
-    )
-
-
-# --- Обработка дайджеста ---
-
-def parse_articles(md_text: str) -> list[dict]:
-    articles = []
-    blocks = md_text.split("---------")
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        if len(lines) < 3:
-            continue
-        title = lines[0].lstrip("# ").strip()
-        tags = lines[1] if len(lines) > 1 else ""
-        url = next((l for l in lines if l.startswith("http")), "")
-        description = lines[-1] if not lines[-1].startswith("http") else ""
-        articles.append({
-            "title": title,
-            "tags": tags,
-            "url": url,
-            "description": description,
-        })
-    return articles
-
-
-DIGEST_PROMPT = """Ты — редактор, который сортирует статьи о кино и сериалах.
-
-Вот список статей. Распредели каждую по категориям по правилам ниже.
-
-ПРАВИЛА КАТЕГОРИЗАЦИИ:
-- ПРОПУСТИТЬ (не включать): новости, анонсы, игры, техника, аниме, комиксы, статьи об индустрии (сборы, рейтинги, бизнес)
-- 📋 ПОДБОРКИ: статьи формата "Лучшие X...", "10 лучших...", рейтинги, списки фильмов/сериалов
-- 🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ: статьи о фильмах/сериалах вышедших примерно в последние 1-3 года (НЕ рецензии, НЕ подборки)
-- 🏛 КЛАССИКА: статьи о фильмах/сериалах вышедших 10 и более лет назад (ключевые слова: "X years later", "classic", "cult", старые названия)
-- 🌟 ПЕРСОНЫ: статьи о конкретных актёрах, режиссёрах, других интересных людях
-
-ВАЖНО:
-- Обработай ВСЕ статьи из списка, не пропускай ни одну подходящую
-- Одна статья может попасть только в одну категорию
-- Статьи о персонах (актёрах) включай в ПЕРСОНЫ, даже если они про старый фильм
-
-ФОРМАТ ОТВЕТА — строго такой, каждая категория на новой строке:
-
-📋 ПОДБОРКИ
-• [Название статьи](ссылка)
-
-🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ
-• [Название статьи](ссылка)
-
-🏛 КЛАССИКА
-• [Название статьи](ссылка)
-
-🌟 ПЕРСОНЫ
-• [Название статьи](ссылка)
-
-Если в категории нет статей — пропусти эту категорию совсем.
-Названия статей НЕ переводи.
-
-Вот статьи:
-
-"""
-
-
-def digest_batch_with_mistral(articles: list[dict]) -> str:
-    articles_text = ""
-    for i, a in enumerate(articles, 1):
-        articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
-
-    return mistral_request(
-        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
-        temperature=0.3,
-        max_tokens=4000,
-    )
-
-
-def merge_digests(batch_results: list[str]) -> str:
-    categories = {
-        "📋 ПОДБОРКИ": [],
-        "🎬 НОВЫЕ ФИЛЬМЫ И СЕРИАЛЫ": [],
-        "🏛 КЛАССИКА": [],
-        "🌟 ПЕРСОНЫ": [],
-    }
-    current_cat = None
-    for result in batch_results:
-        for line in result.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if line in categories:
-                current_cat = line
-            elif line.startswith("•") and current_cat:
-                if line not in categories[current_cat]:
-                    categories[current_cat].append(line)
-
-    parts = []
-    for cat, items in categories.items():
-        if items:
-            parts.append(cat)
-            parts.extend(items)
-            parts.append("")
-    return "\n".join(parts).strip()
-
-
-def digest_with_mistral(articles: list[dict]) -> tuple[str, int]:
-    batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
-    batch_results = []
-    for i, batch in enumerate(batches):
-        logger.info(f"Обрабатываю батч {i+1}/{len(batches)} ({len(batch)} статей)")
-        result = digest_batch_with_mistral(batch)
-        batch_results.append(result)
-        # Пауза между батчами чтобы не превышать 2 RPM
-        if i < len(batches) - 1:
-            logger.info(f"Пауза {BATCH_PAUSE} сек перед следующим батчем...")
-            import time
-            time.sleep(BATCH_PAUSE)
-    return merge_digests(batch_results), len(batches)
-
-
-def is_before_deadline() -> bool:
-    return datetime.now(MSK).hour < DEADLINE_HOUR
-
-
-# --- Обработка дайджеста с ретраями ---
-
-async def process_digest_with_retry(
-    bot, chat_id: int, articles: list[dict], date_str: str, status_msg=None
-):
-    n_batches = (len(articles) + BATCH_SIZE - 1) // BATCH_SIZE
-    attempt = 0
-
-    if status_msg is None:
-        status_msg = await bot.send_message(
-            chat_id=chat_id,
-            text=f"🗞 Получена сводка за {date_str} ({len(articles)} статей). Начинаю обработку..."
+        params4 = urllib.parse.urlencode(post_params).encode()
+        req4 = urllib.request.Request(
+            "https://api.vk.com/method/wall.post",
+            data=params4
         )
+        with urllib.request.urlopen(req4, timeout=15) as resp:
+            result = json.loads(resp.read())
 
-    while True:
-        attempt += 1
-        now_msk = datetime.now(MSK).strftime("%H:%M МСК")
-        logger.info(f"Попытка #{attempt} обработки дайджеста в {now_msk}")
+        if "error" in result:
+            logger.error(f"VK wall.post error: {result['error']}")
+            return False
 
-        # Считаем примерное время: n_batches батчей + паузы между ними
-        est_minutes = (n_batches * 35) // 60 + 1
+        logger.info(f"✅ VK: опубликован пост {result.get('response', {}).get('post_id')}")
+        return True
 
+    except Exception as e:
+        logger.error(f"VK публикация не удалась: {e}")
+        return False
+
+
+# ── URL detection ─────────────────────────────────────────────────────────────
+
+def extract_url(text: str) -> str | None:
+    for word in text.split():
+        if word.startswith("http://") or word.startswith("https://"):
+            return word
+    return None
+
+
+# ── Webhook handler ───────────────────────────────────────────────────────────
+
+@app.route(f"/webhook", methods=["POST"])
+def webhook():
+    if WEBHOOK_SECRET:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if token != WEBHOOK_SECRET:
+            return Response("Forbidden", status=403)
+
+    update = request.get_json(silent=True)
+    if not update:
+        return Response("OK", status=200)
+
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return Response("OK", status=200)
+
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    text = message.get("text", "").strip()
+
+    if user_id != ALLOWED_USER_ID:
+        logger.warning(f"Ignored message from user_id={user_id}")
+        return Response("OK", status=200)
+
+    if not text:
+        return Response("OK", status=200)
+
+    url = extract_url(text)
+    if not url:
+        send_message(chat_id, "👋 Пришли мне ссылку на статью — сделаю пост для канала.")
+        return Response("OK", status=200)
+
+    send_message(chat_id, "⏳ Читаю статью...")
+
+    try:
+        article = parse_article(url)
+        if not article:
+            send_message(chat_id, "❌ Не удалось прочитать статью. Попробуй другую ссылку.")
+            return Response("OK", status=200)
+
+        send_message(chat_id, "✍️ Пишу пост...")
+        post_text = generate_post(article)
+
+        # Отправляем в Telegram
+        send_post(chat_id, post_text, article.image_url, url)
+
+        # Дублируем в VK
         try:
-            await status_msg.edit_text(
-                f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей "
-                f"через Mistral ({n_batches} батчей, ~{est_minutes} мин)..."
-            )
-            result, n_batches_done = digest_with_mistral(articles)
+            vk_ok = publish_to_vk(post_text, article.image_url, url)
+            if vk_ok:
+                send_message(chat_id, "📌 Пост также опубликован в VK")
+        except Exception as vk_err:
+            logger.error(f"VK error: {vk_err}")
 
-            result_filename = f"digest-{date_str}.txt"
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", delete=False, encoding="utf-8"
-            ) as out:
-                out.write(result)
-                out_path = out.name
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        send_message(chat_id, f"❌ Ошибка: {e}")
 
-            await status_msg.delete()
-            await bot.send_document(
-                chat_id=chat_id,
-                document=open(out_path, "rb"),
-                filename=result_filename,
-                caption=(
-                    f"✅ Дайджест за {date_str} готов — "
-                    f"{len(articles)} статей (попытка #{attempt})"
-                ),
-            )
-            os.unlink(out_path)
-            return
-
-        except Exception as e:
-            logger.warning(f"Попытка #{attempt} не удалась: {e}")
-
-            pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
-            next_try = datetime.now(MSK) + timedelta(minutes=pause)
-
-            if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
-                await status_msg.edit_text(
-                    f"❌ Mistral недоступен весь день. Дайджест за {date_str} не получен.\n"
-                    f"Последняя попытка: {now_msk}\n"
-                    f"Ошибка: {str(e)[:200]}"
-                )
-                return
-
-            await status_msg.edit_text(
-                f"⚠️ Попытка #{attempt} не удалась ({now_msk})\n"
-                f"Следующая попытка через {pause} мин."
-            )
-            await asyncio.sleep(pause * 60)
+    return Response("OK", status=200)
 
 
-async def process_digest_external(md_text: str, date_str: str, chat_id: int):
-    articles = parse_articles(md_text)
-    if not articles:
-        logger.warning("/process: статьи не найдены в переданном тексте")
-        await bot_app.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Не удалось найти статьи в файле за {date_str}."
-        )
-        return
-
-    logger.info(f"/process: найдено {len(articles)} статей, запускаю обработку")
-    await process_digest_with_retry(
-        bot=bot_app.bot,
-        chat_id=chat_id,
-        articles=articles,
-        date_str=date_str,
-        status_msg=None,
-    )
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
 
 
-# --- Error handler ---
-
-async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(context.error, Conflict):
-        logger.warning("Конфликт инстансов — ожидаем завершения старого...")
-        return
-    logger.error(f"Ошибка: {context.error}")
-
-
-# --- Telegram Handlers ---
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text(
-            "👋 Привет! Отправь ссылку на статью — сделаю краткое резюме на русском.\n"
-            "Или отправь md-файл для обработки дайджеста."
-        )
-        return
-
-    status_msg = await update.message.reply_text("⏳ Читаю статью...")
-    article_text = fetch_article(url)
-    if not article_text:
-        await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
-        return
-
-    await status_msg.edit_text("🤖 Обрабатываю через Mistral...")
-
-    last_error = None
-    for attempt in range(1, 7):
-        try:
-            result = process_with_mistral(article_text)
-            await status_msg.edit_text(result)
-            return
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Mistral резюме, попытка {attempt}/6: {e}")
-            if attempt < 6:
-                await status_msg.edit_text(
-                    f"⏳ Попытка {attempt}/6 не удалась, повторяю через 10 сек..."
-                )
-                await asyncio.sleep(10)
-
-    await status_msg.edit_text(
-        f"❌ Mistral недоступен — все 6 попыток не удались.\n"
-        f"Попробуй отправить ссылку позже.\nОшибка: {str(last_error)[:200]}"
-    )
-
-
-async def handle_digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📎 Отправь мне md-файл с дайджестом.")
-
-
-async def handle_digest_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc: Document = update.message.document
-    if not doc.file_name.endswith(".md"):
-        await update.message.reply_text("❌ Нужен файл формата .md")
-        return
-
-    status_msg = await update.message.reply_text("⏳ Читаю файл...")
-
-    tg_file = await context.bot.get_file(doc.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
-        await tg_file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
-
-    with open(tmp_path, "r", encoding="utf-8") as f:
-        md_text = f.read()
-    os.unlink(tmp_path)
-
-    articles = parse_articles(md_text)
-    if not articles:
-        await status_msg.edit_text("❌ Не удалось найти статьи в файле.")
-        return
-
-    date_str = doc.file_name.replace("news-", "").replace(".md", "")
-
-    asyncio.create_task(
-        process_digest_with_retry(
-            bot=context.bot,
-            chat_id=update.message.chat_id,
-            articles=articles,
-            date_str=date_str,
-            status_msg=status_msg,
-        )
-    )
-
-
-def main():
-    global bot_loop, bot_app
-
-    thread = threading.Thread(target=run_health_server, daemon=True)
-    thread.start()
-    logger.info(f"Health server запущен на порту {PORT}")
-
-    bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    bot_app.add_error_handler(handle_error)
-    bot_app.add_handler(CommandHandler("digest", handle_digest_command))
-    bot_app.add_handler(MessageHandler(filters.Document.MimeType("text/plain"), handle_digest_file))
-    bot_app.add_handler(MessageHandler(filters.Document.FileExtension("md"), handle_digest_file))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-
-    bot_loop = asyncio.get_event_loop()
-
-    logger.info("Бот запущен!")
-    bot_app.run_polling(drop_pending_updates=False)
+@app.route("/")
+def index():
+    return {"bot": "Cinema Post Bot", "status": "running"}, 200
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
