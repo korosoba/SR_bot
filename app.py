@@ -89,7 +89,7 @@ def send_post(chat_id: int, post_text: str, image_url, source_url: str):
 
 
 def publish_to_vk(post_text: str, image_url, source_url: str) -> bool:
-    """Публикует пост в VK-группу с картинкой если есть."""
+    """Публикует пост в VK-группу — текст + ссылка (VK сам подтянет превью)."""
     if not VK_TOKEN or not VK_GROUP_ID:
         logger.info("VK не настроен, пропускаю")
         return False
@@ -98,84 +98,18 @@ def publish_to_vk(post_text: str, image_url, source_url: str) -> bool:
     vk_text = f"{clean_text}\n\n🔗 {source_url}"
 
     try:
-        attachments = ""
-
-        if image_url:
-            try:
-                # Шаг 1: получаем адрес для загрузки фото
-                params1 = urllib.parse.urlencode({
-                    "group_id": VK_GROUP_ID,
-                    "access_token": VK_TOKEN,
-                    "v": "5.199",
-                }).encode()
-                req1 = urllib.request.Request(
-                    "https://api.vk.com/method/photos.getWallUploadServer",
-                    data=params1
-                )
-                with urllib.request.urlopen(req1, timeout=15) as resp:
-                    upload_server = json.loads(resp.read())
-
-                upload_url = upload_server["response"]["upload_url"]
-
-                # Шаг 2: скачиваем картинку и загружаем на VK
-                with urllib.request.urlopen(image_url, timeout=15) as img_resp:
-                    img_data = img_resp.read()
-
-                boundary = "----VKPhotoBoundary"
-                body = (
-                    f"--{boundary}\r\n"
-                    f'Content-Disposition: form-data; name="photo"; filename="photo.jpg"\r\n'
-                    f"Content-Type: image/jpeg\r\n\r\n"
-                ).encode() + img_data + f"\r\n--{boundary}--\r\n".encode()
-
-                req2 = urllib.request.Request(
-                    upload_url, data=body,
-                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
-                )
-                with urllib.request.urlopen(req2, timeout=30) as resp:
-                    upload_result = json.loads(resp.read())
-
-                # Шаг 3: сохраняем фото
-                params3 = urllib.parse.urlencode({
-                    "group_id": VK_GROUP_ID,
-                    "photo": upload_result.get("photo", ""),
-                    "server": upload_result.get("server", ""),
-                    "hash": upload_result.get("hash", ""),
-                    "access_token": VK_TOKEN,
-                    "v": "5.199",
-                }).encode()
-                req3 = urllib.request.Request(
-                    "https://api.vk.com/method/photos.saveWallPhoto",
-                    data=params3
-                )
-                with urllib.request.urlopen(req3, timeout=15) as resp:
-                    save_result = json.loads(resp.read())
-
-                photo = save_result["response"][0]
-                attachments = f"photo{photo['owner_id']}_{photo['id']}"
-                logger.info("✅ VK: фото загружено")
-
-            except Exception as e:
-                logger.warning(f"VK фото не загрузилось ({e}), публикую без картинки")
-
-        # Шаг 4: публикуем пост
-        post_params = {
+        params = urllib.parse.urlencode({
             "owner_id": f"-{VK_GROUP_ID}",
             "message": vk_text[:4096],
             "access_token": VK_TOKEN,
             "v": "5.199",
-        }
-        if attachments:
-            post_params["attachments"] = attachments
-
-        params4 = urllib.parse.urlencode(post_params).encode()
-        req4 = urllib.request.Request(
+        }).encode()
+        req = urllib.request.Request(
             "https://api.vk.com/method/wall.post",
-            data=params4
+            data=params
         )
-        with urllib.request.urlopen(req4, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
-        logger.info(f"VK getWallUploadServer response: {upload_server}")
 
         if "error" in result:
             logger.error(f"VK wall.post error: {result['error']}")
