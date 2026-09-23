@@ -71,11 +71,30 @@ def send_post(chat_id: int, post_text: str, image_url, source_url: str):
 
     if image_url:
         try:
-            # Скачиваем картинку и отправляем как файл
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            req = urllib.request.Request(image_url, headers=headers)
+            # Скачиваем картинку с браузерным User-Agent
+            req = urllib.request.Request(
+                image_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
             with urllib.request.urlopen(req, timeout=15) as img_resp:
                 img_data = img_resp.read()
+                content_type = img_resp.headers.get("Content-Type", "image/jpeg")
+
+            logger.info(f"Картинка скачана: {len(img_data)} байт, тип: {content_type}")
+
+            # Telegram принимает только JPEG/PNG/GIF/WEBP до 10MB
+            if len(img_data) > 10 * 1024 * 1024:
+                raise Exception(f"Картинка слишком большая: {len(img_data)} байт")
+
+            # Определяем расширение по Content-Type
+            if "png" in content_type:
+                filename, filetype = "photo.png", "image/png"
+            elif "gif" in content_type:
+                filename, filetype = "photo.gif", "image/gif"
+            elif "webp" in content_type:
+                filename, filetype = "photo.webp", "image/webp"
+            else:
+                filename, filetype = "photo.jpg", "image/jpeg"
 
             boundary = "----TGPhotoBoundary"
             body = (
@@ -86,8 +105,8 @@ def send_post(chat_id: int, post_text: str, image_url, source_url: str):
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="parse_mode"\r\n\r\nHTML\r\n'
                 f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="photo"; filename="photo.jpg"\r\n'
-                f"Content-Type: image/jpeg\r\n\r\n"
+                f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+                f"Content-Type: {filetype}\r\n\r\n"
             ).encode() + img_data + f"\r\n--{boundary}--\r\n".encode()
 
             url = f"{POST_API_BASE}/sendPhoto"
@@ -96,7 +115,8 @@ def send_post(chat_id: int, post_text: str, image_url, source_url: str):
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
             )
             with urllib.request.urlopen(req2, timeout=30) as resp:
-                json.loads(resp.read())
+                result = json.loads(resp.read())
+                logger.info(f"✅ Фото отправлено в Telegram")
 
             if len(full_text) > 1024:
                 send_message(chat_id, full_text[1024:])
