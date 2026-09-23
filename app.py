@@ -77,6 +77,7 @@ def send_photo_with_caption(chat_id: int, image_url: str, caption: str):
 def send_post(chat_id: int, post_text: str, image_url, source_url: str):
     full_text = f"{post_text}\n\n🔗 <a href=\"{source_url}\">Источник</a>"
     if image_url:
+        logger.info(f"Пробую отправить фото: {image_url}")  # добавь эту строку
         try:
             caption = full_text[:1024]
             send_photo_with_caption(chat_id, image_url, caption)
