@@ -65,27 +65,46 @@ def send_message(chat_id: int, text: str):
     }, POST_API_BASE)
 
 
-def send_photo_with_caption(chat_id: int, image_url: str, caption: str):
-    tg_post("sendPhoto", {
-        "chat_id": chat_id,
-        "photo": image_url,
-        "caption": caption,
-        "parse_mode": "HTML",
-    }, POST_API_BASE)
-
-
 def send_post(chat_id: int, post_text: str, image_url, source_url: str):
     full_text = f"{post_text}\n\n🔗 <a href=\"{source_url}\">Источник</a>"
+    caption = full_text[:1024]
+
     if image_url:
-        logger.info(f"Пробую отправить фото: {image_url}")  # добавь эту строку
         try:
-            caption = full_text[:1024]
-            send_photo_with_caption(chat_id, image_url, caption)
+            # Скачиваем картинку и отправляем как файл
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            req = urllib.request.Request(image_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as img_resp:
+                img_data = img_resp.read()
+
+            boundary = "----TGPhotoBoundary"
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="parse_mode"\r\n\r\nHTML\r\n'
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="photo"; filename="photo.jpg"\r\n'
+                f"Content-Type: image/jpeg\r\n\r\n"
+            ).encode() + img_data + f"\r\n--{boundary}--\r\n".encode()
+
+            url = f"{POST_API_BASE}/sendPhoto"
+            req2 = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+            )
+            with urllib.request.urlopen(req2, timeout=30) as resp:
+                json.loads(resp.read())
+
             if len(full_text) > 1024:
                 send_message(chat_id, full_text[1024:])
             return
+
         except Exception as e:
             logger.warning(f"Фото не отправилось ({e}), отправляю текстом")
+
     send_message(chat_id, full_text[:4096])
 
 
