@@ -23,10 +23,13 @@ from telegram.error import Conflict
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["NEWS_BOT_TOKEN"]
-MISTRAL_API_KEY = os.environ["MISTRAL_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-MISTRAL_MODEL = "mistral-small-latest"
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+VK_TOKEN = os.getenv("VK_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
 
 BATCH_SIZE = 50
 BATCH_PAUSE = 35
@@ -45,23 +48,20 @@ def get_bot_loop():
     return _bot_loop
 
 
-def mistral_request(messages: list, temperature: float = 0.3, max_tokens: int = 4000) -> str:
-    response = requests.post(
-        MISTRAL_URL,
-        headers={
-            "Authorization": f"Bearer {MISTRAL_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MISTRAL_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        timeout=60,
+def gemini_request(prompt: str, temperature: float = 0.3) -> str:
+    import urllib.request
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": 8192},
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+    return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def fetch_article(url: str):
@@ -71,7 +71,7 @@ def fetch_article(url: str):
     return trafilatura.extract(downloaded)
 
 
-def process_with_mistral(article_text: str) -> str:
+def process_with_gemini(article_text: str) -> str:
     prompt = f"""Ты — помощник, который обрабатывает англоязычные статьи.
 
 Твоя задача:
@@ -86,11 +86,7 @@ def process_with_mistral(article_text: str) -> str:
 Статья:
 {article_text[:6000]}
 """
-    return mistral_request(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=1024,
-    )
+    return gemini_request(prompt, temperature=0.5)
 
 
 def parse_articles(md_text: str) -> list[dict]:
@@ -154,15 +150,11 @@ DIGEST_PROMPT = """Ты — редактор, который сортирует 
 """
 
 
-def digest_batch_with_mistral(articles: list[dict]) -> str:
+def digest_batch_with_gemini(articles: list[dict]) -> str:
     articles_text = ""
     for i, a in enumerate(articles, 1):
         articles_text += f"{i}. {a['title']}\n   Теги: {a['tags']}\n   {a['description']}\n   {a['url']}\n\n"
-    return mistral_request(
-        messages=[{"role": "user", "content": DIGEST_PROMPT + articles_text}],
-        temperature=0.3,
-        max_tokens=4000,
-    )
+    return gemini_request(DIGEST_PROMPT + articles_text, temperature=0.3)
 
 
 def merge_digests(batch_results: list[str]) -> str:
@@ -192,12 +184,12 @@ def merge_digests(batch_results: list[str]) -> str:
     return "\n".join(parts).strip()
 
 
-def digest_with_mistral(articles: list[dict]) -> tuple[str, int]:
+def digest_with_gemini(articles: list[dict]) -> tuple[str, int]:
     batches = [articles[i:i + BATCH_SIZE] for i in range(0, len(articles), BATCH_SIZE)]
     batch_results = []
     for i, batch in enumerate(batches):
         logger.info(f"Батч {i+1}/{len(batches)} ({len(batch)} статей)")
-        result = digest_batch_with_mistral(batch)
+        result = digest_batch_with_gemini(batch)
         batch_results.append(result)
         if i < len(batches) - 1:
             logger.info(f"Пауза {BATCH_PAUSE} сек...")
@@ -209,9 +201,8 @@ def is_before_deadline() -> bool:
     return datetime.now(MSK).hour < DEADLINE_HOUR
 
 
-
 def publish_to_vk(text: str, date_str: str) -> bool:
-    """Публикует дайджест в VK-группу частями (до 4096 символов каждая)."""
+    """Публикует дайджест в VK-группу частями (до 4000 символов каждая)."""
     if not VK_TOKEN or not VK_GROUP_ID:
         logger.info("VK не настроен, пропускаю публикацию")
         return False
@@ -220,11 +211,9 @@ def publish_to_vk(text: str, date_str: str) -> bool:
     import urllib.request
     import urllib.parse
 
-    # Конвертируем markdown-ссылки в обычный текст
     vk_text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
 
-    # Разбиваем на части по 4096 символов, не разрывая строки
-    def split_text(t: str, limit: int = 4000) -> list[str]:
+    def split_text(t: str, limit: int = 4000) -> list:
         parts = []
         lines = t.split("\n")
         current = ""
@@ -266,7 +255,7 @@ def publish_to_vk(text: str, date_str: str) -> bool:
             prefix = f"📰 Дайджест за {date_str}" + (f" ({i}/{total})" if total > 1 else "") + "\n\n"
             post_to_vk(prefix + part)
             if i < total:
-                time.sleep(1)  # пауза между постами
+                time.sleep(1)
         return True
     except Exception as e:
         logger.error(f"VK публикация не удалась: {e}")
@@ -315,7 +304,7 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
         try:
             edit_text(status_id, f"🤖 Попытка #{attempt}: обрабатываю {len(articles)} статей ({n_batches} батчей, ~{est_minutes} мин)...")
-            result, _ = digest_with_mistral(articles)
+            result, _ = digest_with_gemini(articles)
 
             if not result.strip():
                 delete_msg(status_id)
@@ -353,12 +342,6 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             logger.info(f"✅ Дайджест за {date_str} отправлен")
 
-            # VK публикация
-            vk_ok = publish_to_vk(result, date_str)
-            if vk_ok:
-                send_text("📌 Дайджест также опубликован в VK-группе")
-            return
-
         except Exception as e:
             logger.warning(f"Попытка #{attempt} не удалась: {e}")
             pause = PHASE_1_INTERVAL if attempt <= PHASE_1_COUNT else PHASE_2_INTERVAL
@@ -370,6 +353,16 @@ def send_digest(articles: list[dict], date_str: str, chat_id: int):
 
             edit_text(status_id, f"⚠️ Попытка #{attempt} не удалась ({now_msk})\nСледующая попытка через {pause} мин.")
             time.sleep(pause * 60)
+            continue
+
+        # VK публикация — вне основного try/except, не влияет на retry
+        try:
+            vk_ok = publish_to_vk(result, date_str)
+            if vk_ok:
+                send_text("📌 Дайджест также опубликован в VK-группе")
+        except Exception as vk_err:
+            logger.error(f"VK ошибка: {vk_err}")
+        return
 
 
 async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg=None):
@@ -396,9 +389,9 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
             except Exception:
                 pass  # сообщение уже удалено — не критично
 
-            result, _ = digest_with_mistral(articles)
+            result, _ = digest_with_gemini(articles)
 
-            # Если Mistral отфильтровал все статьи — результат пустой
+            # Если AI отфильтровал все статьи — результат пустой
             if not result.strip():
                 try:
                     await status_msg.delete()
@@ -445,7 +438,7 @@ async def process_digest_with_retry(bot, chat_id, articles, date_str, status_msg
             if not is_before_deadline() or next_try.hour >= DEADLINE_HOUR:
                 try:
                     await status_msg.edit_text(
-                        f"❌ Mistral недоступен весь день. Дайджест за {date_str} не получен.\n"
+                        f"❌ Gemini недоступен весь день. Дайджест за {date_str} не получен.\n"
                         f"Последняя попытка: {now_msk}\nОшибка: {str(e)[:200]}"
                     )
                 except Exception:
@@ -499,12 +492,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Не удалось извлечь текст. Попробуй другую ссылку.")
         return
 
-    await status_msg.edit_text("🤖 Обрабатываю через Mistral...")
+    await status_msg.edit_text("🤖 Обрабатываю через Gemini...")
 
     last_error = None
     for attempt in range(1, 7):
         try:
-            result = process_with_mistral(article_text)
+            result = process_with_gemini(article_text)
             await status_msg.edit_text(result)
             return
         except Exception as e:
@@ -514,7 +507,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(10)
 
     await status_msg.edit_text(
-        f"❌ Mistral недоступен — все 6 попыток не удались.\nОшибка: {str(last_error)[:200]}"
+        f"❌ Gemini недоступен — все 6 попыток не удались.\nОшибка: {str(last_error)[:200]}"
     )
 
 
